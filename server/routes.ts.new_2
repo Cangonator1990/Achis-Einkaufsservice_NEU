@@ -1,0 +1,34 @@
+import type { Express } from "express";
+import { createServer, type Server } from "http";
+import { setupAuth } from "./auth";
+import { registerNotificationRoutes } from "./notification-routes";
+import { registerRoutes as registerApiRoutes } from "./routes/index";
+import { isAuthenticated, isAdmin } from "./middleware/auth/auth.middleware";
+import { logger } from "./utils/logger";
+
+/**
+ * Registriert alle Routen in der Express-Anwendung
+ * 
+ * @param app Express-Anwendung
+ * @returns HTTP-Server-Instance
+ */
+export async function registerRoutes(app: Express): Promise<Server> {
+  // Authentifizierungs-Setup
+  await setupAuth(app);
+  
+  // API-Routen registrieren über die neue modulare Struktur
+  registerApiRoutes(app);
+  
+  // Benachrichtigungs-Routen registrieren
+  registerNotificationRoutes(app, isAuthenticated);
+  
+  // API-Route, ob der Server läuft
+  app.get("/api/status", (req, res) => {
+    res.json({ status: "UP", timestamp: new Date().toISOString() });
+  });
+
+  // Server erstellen und zurückgeben
+  logger.info("Alle Routen erfolgreich registriert.");
+  const server = createServer(app);
+  return server;
+}

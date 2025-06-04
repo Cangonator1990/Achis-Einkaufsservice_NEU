@@ -1,0 +1,1 @@
+ALTER TABLE "users" ADD COLUMN "show_order_instructions" boolean DEFAULT true NOT NULL;

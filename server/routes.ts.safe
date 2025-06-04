@@ -1,0 +1,1779 @@
+import type { Express, Request, Response } from "express";
+import { createServer, type Server } from "http";
+import { storage } from "./storage";
+import { setupAuth } from "./auth";
+import { 
+  insertAddressSchema, 
+  insertOrderSchema, 
+  insertOrderItemSchema,
+  insertProductImageSchema,
+  timeSlotSchema,
+  orderStatusSchema
+} from "@shared/schema";
+import { z } from "zod";
+import express from "express";
+import session from "express-session";
+import passport from "passport";
+import { Strategy as LocalStrategy } from "passport-local";
+import MemoryStore from "memorystore";
+import "./types"; // Import type augmentation
+import multer from "multer";
+import path from "path";
+import fs from "fs";
+import { randomUUID } from "crypto";
+import { db } from "./db";
+import { sql } from "drizzle-orm";
+import { registerNotificationRoutes } from "./notification-routes";
+import { ImageService, decodeMultipleImages, convertImagesToMultiFormat } from "./imageService";
+
+export async function registerRoutes(app: Express): Promise<Server> {
+  // Sessionkonfiguration wird jetzt in auth.ts übernommen
+
+  // Set up authentication routes (this will configure passport strategies)
+  await setupAuth(app);
+  
+  // Sicherstellen, dass der Upload-Ordner existiert und persistent ist
+  const uploadDir = 'public/uploads/products/';
+  try {
+    // Erstelle alle benötigten Verzeichnisse rekursiv
+    if (!fs.existsSync('public')) {
+      fs.mkdirSync('public', { recursive: true });
+    }
+    if (!fs.existsSync('public/uploads')) {
+      fs.mkdirSync('public/uploads', { recursive: true });
+    }
+    if (!fs.existsSync(uploadDir)) {
+      fs.mkdirSync(uploadDir, { recursive: true });
+    }
+    
+    // Setze Berechtigungen für bessere Persistenz (falls unterstützt)
+    try {
+      fs.chmodSync(uploadDir, 0o777);
+    } catch (e) {
+      console.warn("Konnte Berechtigungen für Upload-Verzeichnis nicht setzen:", e);
+    }
+    
+    console.log("Upload-Verzeichnisse wurden überprüft und ggf. erstellt.");
+  } catch (error) {
+    console.error("Fehler beim Erstellen der Upload-Verzeichnisse:", error);
+  }
+
+  // Multer-Konfiguration für Datei-Uploads
+  const storage = multer.diskStorage({
+    destination: function (req, file, cb) {
+      cb(null, uploadDir);
+    },
+    filename: function (req, file, cb) {
+      // Generiere einen eindeutigen Dateinamen
+      const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+      const fileExt = path.extname(file.originalname);
+      cb(null, file.fieldname + '-' + uniqueSuffix + fileExt);
+    }
+  });
+  
+  const upload = multer({ 
+    storage: storage,
+    limits: {
+      fileSize: 5 * 1024 * 1024, // 5MB Größenbeschränkung
+    },
+    fileFilter: function(req, file, cb) {
+      // Nur Bild-Dateitypen akzeptieren
+      const filetypes = /jpeg|jpg|png|gif|webp/;
+      const mimetype = filetypes.test(file.mimetype);
+      const extname = filetypes.test(path.extname(file.originalname).toLowerCase());
+      
+      if (mimetype && extname) {
+        return cb(null, true);
+      }
+      cb(new Error("Nur Bilddateien sind erlaubt (JPEG, JPG, PNG, GIF, WEBP)"));
+    }
+  });
+
+  // Erstelle ein HTTP-Server-Objekt für Express
+  const server = createServer(app);
+
+  // ImageService initialisieren
+  const imageService = new ImageService(storage);
+
+  /**
+   * Middleware to check if a user is authenticated
+   */
+  const isAuthenticated = (req: Request, res: Response, next: Function) => {
+    if (req.isAuthenticated()) {
+      return next();
+    }
+    res.status(401).json({ message: "Nicht authentifiziert" });
+  };
+
+  /**
+   * Middleware to check if a user is an admin
+   */
+  const isAdmin = (req: Request, res: Response, next: Function) => {
+    if (req.isAuthenticated() && req.user.role === "admin") {
+      return next();
+    }
+    res.status(403).json({ message: "Zugriff verweigert" });
+  };
+
+  // Registriere Notification-Routen
+  registerNotificationRoutes(app, isAuthenticated);
+
+  // Konfigurieren Sie hier Ihre API-Routen
+  app.get("/api/user", isAuthenticated, (req, res) => {
+    // Nur die notwendigen Daten zurückgeben, Passwort ausschließen
+    const { password, ...userWithoutPassword } = req.user;
+    res.json(userWithoutPassword);
+  });
+
+  app.get("/api/user/preferences/order-instructions", isAuthenticated, async (req, res) => {
+    try {
+      const user = await storage.getUser(req.user.id);
+      res.json({ show: user?.showOrderInstructions ?? true });
+    } catch (error) {
+      res.status(500).json({ message: "Fehler beim Abrufen der Benutzereinstellungen" });
+    }
+  });
+
+  app.post("/api/user/preferences/order-instructions", isAuthenticated, async (req, res) => {
+    try {
+      const { show } = req.body;
+      if (typeof show !== 'boolean') {
+        return res.status(400).json({ message: "Ungültiger Wert für 'show'" });
+      }
+      await storage.setShowOrderInstructions(req.user.id, show);
+      res.json({ success: true });
+    } catch (error) {
+      res.status(500).json({ message: "Fehler beim Speichern der Benutzereinstellungen" });
+    }
+  });
+
+  app.patch("/api/user", isAuthenticated, async (req, res) => {
+    try {
+      const updateData = req.body;
+      // Bestimmte Felder sollten nicht aktualisierbar sein
+      delete updateData.password;
+      delete updateData.role;
+      delete updateData.id;
+      delete updateData.isActive;
+      
+      // Datumskonvertierung
+      if (updateData.birthDate) {
+        updateData.birthDate = new Date(updateData.birthDate);
+      }
+      
+      const updatedUser = await storage.updateUser(req.user.id, updateData);
+      
+      // Passwort aus der Antwort entfernen
+      const { password, ...safeUser } = updatedUser;
+      
+      res.json(safeUser);
+    } catch (error) {
+      res.status(500).json({ message: "Fehler beim Aktualisieren des Benutzerprofils" });
+    }
+  });
+
+  // Adressrouten
+  app.get("/api/addresses", isAuthenticated, async (req, res) => {
+    try {
+      const addresses = await storage.getAddressesByUserId(req.user.id);
+      res.json(addresses);
+    } catch (error) {
+      res.status(500).json({ message: "Fehler beim Abrufen der Adressen" });
+    }
+  });
+
+  app.get("/api/addresses/default", isAuthenticated, async (req, res) => {
+    try {
+      const defaultAddress = await storage.getDefaultAddress(req.user.id);
+      if (!defaultAddress) {
+        return res.status(404).json({ message: "Keine Standardadresse gefunden" });
+      }
+      res.json(defaultAddress);
+    } catch (error) {
+      res.status(500).json({ message: "Fehler beim Abrufen der Standardadresse" });
+    }
+  });
+
+  app.get("/api/addresses/:id", isAuthenticated, async (req, res) => {
+    try {
+      const addressId = parseInt(req.params.id);
+      const address = await storage.getAddressById(addressId);
+      
+      if (!address) {
+        return res.status(404).json({ message: "Adresse nicht gefunden" });
+      }
+      
+      // Sicherheitsprüfung: Nur eigene Adressen abrufen
+      if (address.userId !== req.user.id) {
+        return res.status(403).json({ message: "Zugriff verweigert" });
+      }
+      
+      res.json(address);
+    } catch (error) {
+      res.status(500).json({ message: "Fehler beim Abrufen der Adresse" });
+    }
+  });
+
+  app.post("/api/addresses", isAuthenticated, async (req, res) => {
+    try {
+      // Validierung mit Zod
+      const validatedData = insertAddressSchema.parse({
+        ...req.body,
+        userId: req.user.id // Stellen Sie sicher, dass die Adresse dem angemeldeten Benutzer gehört
+      });
+      
+      const newAddress = await storage.createAddress(validatedData);
+      
+      // Wenn isDefault gesetzt ist, setzen Sie diese Adresse als Standard
+      if (req.body.isDefault) {
+        await storage.setDefaultAddress(req.user.id, newAddress.id);
+      }
+      
+      res.status(201).json(newAddress);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ 
+          message: "Validierungsfehler", 
+          errors: error.errors 
+        });
+      }
+      res.status(500).json({ message: "Fehler beim Erstellen der Adresse" });
+    }
+  });
+
+  app.patch("/api/addresses/:id", isAuthenticated, async (req, res) => {
+    try {
+      const addressId = parseInt(req.params.id);
+      const address = await storage.getAddressById(addressId);
+      
+      if (!address) {
+        return res.status(404).json({ message: "Adresse nicht gefunden" });
+      }
+      
+      // Sicherheitsprüfung: Nur eigene Adressen aktualisieren
+      if (address.userId !== req.user.id) {
+        return res.status(403).json({ message: "Zugriff verweigert" });
+      }
+      
+      // Validierung der Daten
+      const updateData = req.body;
+      delete updateData.userId; // Benutzer-ID kann nicht geändert werden
+      delete updateData.id; // ID kann nicht geändert werden
+      
+      const updatedAddress = await storage.updateAddress(addressId, updateData);
+      
+      // Wenn isDefault gesetzt ist, setzen Sie diese Adresse als Standard
+      if (req.body.isDefault) {
+        await storage.setDefaultAddress(req.user.id, addressId);
+      }
+      
+      res.json(updatedAddress);
+    } catch (error) {
+      res.status(500).json({ message: "Fehler beim Aktualisieren der Adresse" });
+    }
+  });
+
+  app.delete("/api/addresses/:id", isAuthenticated, async (req, res) => {
+    try {
+      const addressId = parseInt(req.params.id);
+      const address = await storage.getAddressById(addressId);
+      
+      if (!address) {
+        return res.status(404).json({ message: "Adresse nicht gefunden" });
+      }
+      
+      // Sicherheitsprüfung: Nur eigene Adressen löschen
+      if (address.userId !== req.user.id) {
+        return res.status(403).json({ message: "Zugriff verweigert" });
+      }
+
+      const result = await storage.deleteAddress(addressId);
+      
+      if (!result.success) {
+        return res.status(400).json({ message: result.message || "Adresse konnte nicht gelöscht werden" });
+      }
+      
+      res.json({ success: true });
+    } catch (error) {
+      res.status(500).json({ message: "Fehler beim Löschen der Adresse" });
+    }
+  });
+
+  app.post("/api/addresses/:id/default", isAuthenticated, async (req, res) => {
+    try {
+      const addressId = parseInt(req.params.id);
+      const address = await storage.getAddressById(addressId);
+      
+      if (!address) {
+        return res.status(404).json({ message: "Adresse nicht gefunden" });
+      }
+      
+      // Sicherheitsprüfung: Nur eigene Adressen als Standard setzen
+      if (address.userId !== req.user.id) {
+        return res.status(403).json({ message: "Zugriff verweigert" });
+      }
+      
+      const success = await storage.setDefaultAddress(req.user.id, addressId);
+      
+      if (!success) {
+        return res.status(500).json({ message: "Die Standardadresse konnte nicht gesetzt werden" });
+      }
+      
+      res.json({ success: true });
+    } catch (error) {
+      res.status(500).json({ message: "Fehler beim Setzen der Standardadresse" });
+    }
+  });
+
+  // Bestellungsrouten
+  app.get("/api/orders", isAuthenticated, async (req, res) => {
+    try {
+      const orders = await storage.getOrdersByUserId(req.user.id);
+      res.json(orders);
+    } catch (error) {
+      res.status(500).json({ message: "Fehler beim Abrufen der Bestellungen" });
+    }
+  });
+
+  app.get("/api/orders/:id", isAuthenticated, async (req, res) => {
+    try {
+      const orderId = parseInt(req.params.id);
+      const order = await storage.getOrderById(orderId);
+      
+      if (!order) {
+        return res.status(404).json({ message: "Bestellung nicht gefunden" });
+      }
+      
+      // Sicherheitsprüfung: Nur eigene Bestellungen abrufen, es sei denn, der Benutzer ist ein Admin
+      if (order.userId !== req.user.id && req.user.role !== "admin") {
+        return res.status(403).json({ message: "Zugriff verweigert" });
+      }
+      
+      // Items laden
+      const items = await storage.getOrderItemsByOrderId(orderId);
+      
+      // Für jedes OrderItem die zugehörigen Bilder laden
+      const itemsWithImages = await Promise.all(items.map(async (item) => {
+        const images = await storage.getProductImagesByOrderItemId(item.id);
+        return {
+          ...item,
+          images,
+          // Nur die URL der Bilder als String
+          imageUrl: convertImagesToMultiFormat(images)
+        };
+      }));
+      
+      // Order mit Items zurückgeben
+      res.json({
+        ...order,
+        items: itemsWithImages
+      });
+    } catch (error) {
+      console.error("Error fetching order:", error);
+      res.status(500).json({ message: "Fehler beim Abrufen der Bestellung" });
+    }
+  });
+
+  app.post("/api/orders", isAuthenticated, async (req, res) => {
+    try {
+      // Validierung mit Zod
+      const orderData = insertOrderSchema.parse({
+        ...req.body,
+        userId: req.user.id,
+        orderNumber: `ORD-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+        status: 'pending',
+        createdAt: new Date(),
+        updatedAt: new Date()
+      });
+
+      // Führen Sie zusätzliche Validierungen durch
+      if (!orderData.deliveryAddressId) {
+        return res.status(400).json({ message: "Lieferadresse ist erforderlich" });
+      }
+
+      if (!orderData.desiredDeliveryDate) {
+        return res.status(400).json({ message: "Gewünschter Liefertermin ist erforderlich" });
+      }
+
+      // Validieren Sie das gewünschte Lieferzeitfenster mit dem Zod-Schema
+      try {
+        timeSlotSchema.parse(orderData.desiredTimeSlot);
+      } catch (e) {
+        return res.status(400).json({ message: "Ungültiges Lieferzeitfenster" });
+      }
+
+      // Erstellen Sie die Bestellung
+      const newOrder = await storage.createOrder(orderData);
+
+      // Erstellen Sie die Bestellpositionen
+      const { items } = req.body;
+      if (!items || !Array.isArray(items) || items.length === 0) {
+        // Rollback the order if there are no items
+        await storage.deleteOrder(newOrder.id);
+        return res.status(400).json({ message: "Bestellung muss mindestens einen Artikel enthalten" });
+      }
+
+      const orderItems = [];
+      for (const item of items) {
+        try {
+          // Validieren Sie die Bestellposition
+          const validatedItem = insertOrderItemSchema.parse({
+            ...item,
+            orderId: newOrder.id,
+            createdAt: new Date(),
+            updatedAt: new Date()
+          });
+
+          const newOrderItem = await storage.createOrderItem({
+            ...validatedItem,
+            orderId: newOrder.id
+          });
+          
+          // Speichern Sie Bilder, falls vorhanden
+          if (item.imageUrl || item.filePath) {
+            await imageService.saveImagesForOrderItem(newOrderItem.id, item.imageUrl, item.filePath);
+          }
+
+          orderItems.push(newOrderItem);
+        } catch (error) {
+          console.error("Fehler beim Erstellen der Bestellposition:", error);
+          // Fahren Sie trotz Fehler fort, um so viele Positionen wie möglich zu speichern
+        }
+      }
+
+      // Benachrichtigung für Administratoren erstellen
+      const admins = (await storage.getAllUsers()).filter(user => user.role === "admin");
+      for (const admin of admins) {
+        await storage.createNotification({
+          userId: admin.id,
+          type: "new_order",
+          message: `Neue Bestellung eingegangen: ${newOrder.orderNumber}`,
+          relatedOrderId: newOrder.id
+        });
+      }
+
+      // Warenkorb leeren
+      const activeCart = await storage.getActiveCart(req.user.id);
+      if (activeCart) {
+        await storage.deactivateCart(activeCart.id);
+      }
+
+      // Bestätigungsbenachrichtigung für den Kunden
+      await storage.createNotification({
+        userId: req.user.id,
+        type: "order_received",
+        message: `Ihre Bestellung ${newOrder.orderNumber} wurde erfolgreich aufgegeben.`,
+        relatedOrderId: newOrder.id
+      });
+
+      res.status(201).json({
+        ...newOrder,
+        items: orderItems
+      });
+    } catch (error) {
+      console.error("Error creating order:", error);
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ 
+          message: "Validierungsfehler", 
+          errors: error.errors 
+        });
+      }
+      res.status(500).json({ message: "Fehler beim Erstellen der Bestellung" });
+    }
+  });
+
+  app.patch("/api/orders/:id", isAuthenticated, async (req, res) => {
+    try {
+      const orderId = parseInt(req.params.id);
+      const order = await storage.getOrderById(orderId);
+      
+      if (!order) {
+        return res.status(404).json({ message: "Bestellung nicht gefunden" });
+      }
+      
+      // Sicherheitsprüfung: Nur eigene Bestellungen aktualisieren, es sei denn, der Benutzer ist ein Admin
+      if (order.userId !== req.user.id && req.user.role !== "admin") {
+        return res.status(403).json({ message: "Zugriff verweigert" });
+      }
+      
+      // Prüfen, ob die Bestellung gesperrt ist
+      if (order.isLocked && req.user.role !== "admin") {
+        return res.status(403).json({ message: "Diese Bestellung ist gesperrt und kann nicht mehr geändert werden" });
+      }
+      
+      // Validierung nach Status
+      // Kunden dürfen nur bestimmte Felder aktualisieren, abhängig vom Status
+      let updateData: any = {};
+      
+      if (req.user.role === "admin") {
+        // Admins dürfen alle Felder aktualisieren außer der ID
+        updateData = { ...req.body };
+        delete updateData.id;
+        delete updateData.userId; // Benutzer-ID kann nicht geändert werden
+        delete updateData.orderNumber; // Bestellnummer kann nicht geändert werden
+      } else {
+        // Kunden dürfen nur aktualisieren, wenn der Status 'pending' ist
+        if (order.status !== 'pending' && 
+            order.status !== 'pending_customer_review' && 
+            order.status !== 'pending_customer_action') {
+          return res.status(403).json({ 
+            message: "Diese Bestellung kann nicht mehr geändert werden, da sie bereits in Bearbeitung ist" 
+          });
+        }
+        
+        // Nur bestimmte Felder erlauben
+        const allowedFields = [
+          'notes', 
+          'desiredDeliveryDate', 
+          'desiredTimeSlot',
+          'deliveryAddressId'
+        ];
+        
+        allowedFields.forEach(field => {
+          if (req.body[field] !== undefined) {
+            updateData[field] = req.body[field];
+          }
+        });
+      }
+      
+      // Validieren, wenn das Status-Feld aktualisiert wird
+      if (updateData.status) {
+        try {
+          orderStatusSchema.parse(updateData.status);
+        } catch (e) {
+          return res.status(400).json({ message: "Ungültiger Bestellstatus" });
+        }
+      }
+      
+      // Konvertieren Sie Datumsfelder in Date-Objekte
+      const dateFields = ['desiredDeliveryDate', 'finalDeliveryDate', 'suggestedDeliveryDate'];
+      dateFields.forEach(field => {
+        if (updateData[field]) {
+          updateData[field] = new Date(updateData[field]);
+        }
+      });
+      
+      // Bestellung aktualisieren
+      const updatedOrder = await storage.updateOrder(orderId, updateData);
+
+      // Möglicherweise Benachrichtigungen senden bei bestimmten Statusänderungen
+      if (updateData.status) {
+        // Status-spezifische Benachrichtigungen
+        if (updateData.status === 'processing') {
+          await storage.createNotification({
+            userId: order.userId,
+            type: "order_processing",
+            message: `Ihre Bestellung ${order.orderNumber} wird jetzt bearbeitet.`,
+            relatedOrderId: order.id
+          });
+        } else if (updateData.status === 'completed') {
+          await storage.createNotification({
+            userId: order.userId,
+            type: "order_completed",
+            message: `Ihre Bestellung ${order.orderNumber} wurde erfolgreich abgeschlossen.`,
+            relatedOrderId: order.id
+          });
+        } else if (updateData.status === 'cancelled') {
+          await storage.createNotification({
+            userId: order.userId,
+            type: "order_cancelled",
+            message: `Ihre Bestellung ${order.orderNumber} wurde storniert.`,
+            relatedOrderId: order.id
+          });
+        }
+      }
+      
+      // Items mit der Bestellung zurückgeben
+      const items = await storage.getOrderItemsByOrderId(orderId);
+      res.json({
+        ...updatedOrder,
+        items
+      });
+    } catch (error) {
+      console.error("Error updating order:", error);
+      res.status(500).json({ message: "Fehler beim Aktualisieren der Bestellung" });
+    }
+  });
+
+  app.patch("/api/orders/:id/cancel", isAuthenticated, async (req, res) => {
+    try {
+      const orderId = parseInt(req.params.id);
+      const order = await storage.getOrderById(orderId);
+      
+      if (!order) {
+        return res.status(404).json({ message: "Bestellung nicht gefunden" });
+      }
+      
+      // Sicherheitsprüfung: Nur eigene Bestellungen stornieren (Admins dürfen alle stornieren)
+      if (order.userId !== req.user.id && req.user.role !== "admin") {
+        return res.status(403).json({ message: "Zugriff verweigert" });
+      }
+      
+      // Prüfen, ob die Bestellung bereits abgeschlossen oder storniert ist
+      if (order.status === 'completed' || order.status === 'cancelled') {
+        return res.status(400).json({ 
+          message: `Diese Bestellung kann nicht storniert werden, da sie bereits ${
+            order.status === 'completed' ? 'abgeschlossen' : 'storniert'
+          } ist` 
+        });
+      }
+      
+      // Bestellung stornieren
+      const cancelledOrder = await storage.cancelOrder(orderId);
+      
+      // Benachrichtigung für den Administrator erstellen
+      if (req.user.role !== "admin") {
+        const admins = (await storage.getAllUsers()).filter(user => user.role === "admin");
+        for (const admin of admins) {
+          await storage.createNotification({
+            userId: admin.id,
+            type: "order_cancelled",
+            message: `Die Bestellung ${order.orderNumber} wurde vom Kunden storniert.`,
+            relatedOrderId: order.id
+          });
+        }
+      }
+      
+      // Benachrichtigung für den Kunden, wenn ein Admin storniert hat
+      if (req.user.role === "admin" && req.user.id !== order.userId) {
+        await storage.createNotification({
+          userId: order.userId,
+          type: "order_cancelled",
+          message: `Ihre Bestellung ${order.orderNumber} wurde storniert.`,
+          relatedOrderId: order.id
+        });
+      }
+      
+      res.json(cancelledOrder);
+    } catch (error) {
+      res.status(500).json({ message: "Fehler beim Stornieren der Bestellung" });
+    }
+  });
+
+  app.delete("/api/orders/:id", isAdmin, async (req, res) => {
+    try {
+      const orderId = parseInt(req.params.id);
+      const order = await storage.getOrderById(orderId);
+      
+      if (!order) {
+        return res.status(404).json({ message: "Bestellung nicht gefunden" });
+      }
+      
+      // Bestellung löschen (soft delete)
+      const deleted = await storage.deleteOrder(orderId);
+      
+      if (!deleted) {
+        return res.status(500).json({ message: "Bestellung konnte nicht gelöscht werden" });
+      }
+      
+      // Benachrichtigung für den Kunden
+      await storage.createNotification({
+        userId: order.userId,
+        type: "order_deleted",
+        message: `Ihre Bestellung ${order.orderNumber} wurde aus unserem System entfernt.`,
+        relatedOrderId: order.id
+      });
+      
+      res.json({ success: true });
+    } catch (error) {
+      res.status(500).json({ message: "Fehler beim Löschen der Bestellung" });
+    }
+  });
+
+  app.post("/api/orders/:id/restore", isAdmin, async (req, res) => {
+    try {
+      const orderId = parseInt(req.params.id);
+      
+      const restoredOrder = await storage.restoreOrder(orderId);
+      
+      if (!restoredOrder) {
+        return res.status(500).json({ message: "Bestellung konnte nicht wiederhergestellt werden" });
+      }
+      
+      // Benachrichtigung für den Kunden
+      await storage.createNotification({
+        userId: restoredOrder.userId,
+        type: "order_restored",
+        message: `Ihre Bestellung ${restoredOrder.orderNumber} wurde wiederhergestellt.`,
+        relatedOrderId: restoredOrder.id
+      });
+      
+      res.json(restoredOrder);
+    } catch (error) {
+      res.status(500).json({ message: "Fehler beim Wiederherstellen der Bestellung" });
+    }
+  });
+
+  // Route für Bestellpositionen einer bestimmten Bestellung
+  app.get("/api/orders/:orderId/items", isAuthenticated, async (req, res) => {
+    try {
+      const orderId = parseInt(req.params.orderId);
+      const order = await storage.getOrderById(orderId);
+      
+      if (!order) {
+        return res.status(404).json({ message: "Bestellung nicht gefunden" });
+      }
+      
+      // Sicherheitsprüfung: Nur eigene Bestellungen (für Admins alle)
+      if (order.userId !== req.user.id && req.user.role !== "admin") {
+        return res.status(403).json({ message: "Zugriff verweigert" });
+      }
+      
+      const items = await storage.getOrderItemsByOrderId(orderId);
+      
+      // Bilder für jedes Item laden
+      const itemsWithImages = await Promise.all(items.map(async (item) => {
+        const images = await storage.getProductImagesByOrderItemId(item.id);
+        return {
+          ...item,
+          images
+        };
+      }));
+      
+      res.json(itemsWithImages);
+    } catch (error) {
+      res.status(500).json({ message: "Fehler beim Abrufen der Bestellpositionen" });
+    }
+  });
+
+  // Erstellen einer neuen Bestellposition für eine bestehende Bestellung
+  app.post("/api/orders/:orderId/items", isAuthenticated, async (req, res) => {
+    try {
+      const orderId = parseInt(req.params.orderId);
+      const order = await storage.getOrderById(orderId);
+      
+      if (!order) {
+        return res.status(404).json({ message: "Bestellung nicht gefunden" });
+      }
+      
+      // Sicherheitsprüfung
+      if (order.userId !== req.user.id && req.user.role !== "admin") {
+        return res.status(403).json({ message: "Zugriff verweigert" });
+      }
+      
+      // Prüfen, ob die Bestellung bereits abgeschlossen oder storniert ist
+      if (order.status === 'completed' || order.status === 'cancelled') {
+        return res.status(400).json({ 
+          message: `Dieser Bestellung können keine Artikel mehr hinzugefügt werden, da sie bereits ${
+            order.status === 'completed' ? 'abgeschlossen' : 'storniert'
+          } ist` 
+        });
+      }
+      
+      // Validieren Sie die Daten
+      const orderItemData = insertOrderItemSchema.parse({
+        ...req.body,
+        orderId,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      });
+      
+      // Erstellen Sie die Bestellposition
+      const newOrderItem = await storage.createOrderItem({
+        ...orderItemData,
+        orderId
+      });
+      
+      // Speichern Sie Bilder, falls vorhanden
+      if (req.body.imageUrl || req.body.filePath) {
+        await imageService.saveImagesForOrderItem(newOrderItem.id, req.body.imageUrl, req.body.filePath);
+      }
+      
+      // Aktualisieren Sie die Bestellung (z.B. Gesamtpreis)
+      await storage.updateOrder(orderId, {
+        updatedAt: new Date()
+      });
+      
+      res.status(201).json(newOrderItem);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ 
+          message: "Validierungsfehler", 
+          errors: error.errors 
+        });
+      }
+      res.status(500).json({ message: "Fehler beim Erstellen der Bestellposition" });
+    }
+  });
+
+  // Aktualisieren einer Bestellposition
+  app.patch("/api/orders/:orderId/items/:itemId", isAuthenticated, async (req, res) => {
+    try {
+      const orderId = parseInt(req.params.orderId);
+      const itemId = parseInt(req.params.itemId);
+      
+      // Bestellung und Bestellposition abrufen
+      const order = await storage.getOrderById(orderId);
+      const orderItem = await storage.getOrderItem(itemId);
+      
+      if (!order) {
+        return res.status(404).json({ message: "Bestellung nicht gefunden" });
+      }
+      
+      if (!orderItem) {
+        return res.status(404).json({ message: "Bestellposition nicht gefunden" });
+      }
+      
+      // Stellen Sie sicher, dass die Bestellposition zu dieser Bestellung gehört
+      if (orderItem.orderId !== orderId) {
+        return res.status(400).json({ message: "Die Bestellposition gehört nicht zu dieser Bestellung" });
+      }
+      
+      // Sicherheitsprüfung
+      if (order.userId !== req.user.id && req.user.role !== "admin") {
+        return res.status(403).json({ message: "Zugriff verweigert" });
+      }
+      
+      // Prüfen, ob die Bestellung bereits abgeschlossen oder storniert ist
+      if (order.status === 'completed' || order.status === 'cancelled') {
+        return res.status(400).json({ 
+          message: `Diese Bestellposition kann nicht mehr aktualisiert werden, da die Bestellung bereits ${
+            order.status === 'completed' ? 'abgeschlossen' : 'storniert'
+          } ist` 
+        });
+      }
+      
+      // Aktualisieren Sie die Bestellposition
+      const updateData = { ...req.body };
+      delete updateData.id; // ID kann nicht geändert werden
+      delete updateData.orderId; // OrderID kann nicht geändert werden
+      
+      const updatedOrderItem = await storage.updateOrderItem(itemId, updateData);
+      
+      // Bilder aktualisieren, falls vorhanden
+      if (req.body.imageUrl || req.body.filePath) {
+        await imageService.saveImagesForOrderItem(itemId, req.body.imageUrl, req.body.filePath);
+      }
+      
+      // Aktualisieren Sie die Bestellung (z.B. Zeitstempel)
+      await storage.updateOrder(orderId, {
+        updatedAt: new Date()
+      });
+      
+      res.json(updatedOrderItem);
+    } catch (error) {
+      res.status(500).json({ message: "Fehler beim Aktualisieren der Bestellposition" });
+    }
+  });
+
+  // Löschen einer Bestellposition
+  app.delete("/api/orders/:orderId/items/:itemId", isAuthenticated, async (req, res) => {
+    try {
+      const orderId = parseInt(req.params.orderId);
+      const itemId = parseInt(req.params.itemId);
+      
+      // Bestellung und Bestellposition abrufen
+      const order = await storage.getOrderById(orderId);
+      const orderItem = await storage.getOrderItem(itemId);
+      
+      if (!order) {
+        return res.status(404).json({ message: "Bestellung nicht gefunden" });
+      }
+      
+      if (!orderItem) {
+        return res.status(404).json({ message: "Bestellposition nicht gefunden" });
+      }
+      
+      // Stellen Sie sicher, dass die Bestellposition zu dieser Bestellung gehört
+      if (orderItem.orderId !== orderId) {
+        return res.status(400).json({ message: "Die Bestellposition gehört nicht zu dieser Bestellung" });
+      }
+      
+      // Sicherheitsprüfung
+      if (order.userId !== req.user.id && req.user.role !== "admin") {
+        return res.status(403).json({ message: "Zugriff verweigert" });
+      }
+      
+      // Prüfen, ob die Bestellung bereits abgeschlossen oder storniert ist
+      if (order.status === 'completed' || order.status === 'cancelled') {
+        return res.status(400).json({ 
+          message: `Diese Bestellposition kann nicht mehr gelöscht werden, da die Bestellung bereits ${
+            order.status === 'completed' ? 'abgeschlossen' : 'storniert'
+          } ist` 
+        });
+      }
+      
+      // Löschen Sie die Bestellposition
+      const deleted = await storage.deleteOrderItem(itemId);
+      
+      if (!deleted) {
+        return res.status(500).json({ message: "Bestellposition konnte nicht gelöscht werden" });
+      }
+      
+      // Aktualisieren Sie die Bestellung (z.B. Zeitstempel)
+      await storage.updateOrder(orderId, {
+        updatedAt: new Date()
+      });
+      
+      res.json({ success: true });
+    } catch (error) {
+      res.status(500).json({ message: "Fehler beim Löschen der Bestellposition" });
+    }
+  });
+
+  // Download-Route für Produktbilder einer Bestellposition
+  app.get("/api/orders/:orderId/items/:itemId/images", isAuthenticated, async (req, res) => {
+    try {
+      const orderId = parseInt(req.params.orderId);
+      const itemId = parseInt(req.params.itemId);
+      
+      // Bestellung und Bestellposition abrufen
+      const order = await storage.getOrderById(orderId);
+      const orderItem = await storage.getOrderItem(itemId);
+      
+      if (!order) {
+        return res.status(404).json({ message: "Bestellung nicht gefunden" });
+      }
+      
+      if (!orderItem) {
+        return res.status(404).json({ message: "Bestellposition nicht gefunden" });
+      }
+      
+      // Stellen Sie sicher, dass die Bestellposition zu dieser Bestellung gehört
+      if (orderItem.orderId !== orderId) {
+        return res.status(400).json({ message: "Die Bestellposition gehört nicht zu dieser Bestellung" });
+      }
+      
+      // Sicherheitsprüfung
+      if (order.userId !== req.user.id && req.user.role !== "admin") {
+        return res.status(403).json({ message: "Zugriff verweigert" });
+      }
+      
+      // Bilder der Bestellposition abrufen
+      const images = await storage.getProductImagesByOrderItemId(itemId);
+      
+      res.json(images);
+    } catch (error) {
+      res.status(500).json({ message: "Fehler beim Abrufen der Bilder" });
+    }
+  });
+
+  // Produktbild als Hauptbild festlegen
+  app.post("/api/product-images/:id/set-main", isAuthenticated, async (req, res) => {
+    try {
+      const imageId = parseInt(req.params.id);
+      
+      // Bild abrufen
+      const image = await storage.getProductImage(imageId);
+      
+      if (!image) {
+        return res.status(404).json({ message: "Bild nicht gefunden" });
+      }
+      
+      // Wenn es zu einem OrderItem gehört, prüfen Sie die Bestellung
+      if (image.orderItemId) {
+        const orderItem = await storage.getOrderItem(image.orderItemId);
+        if (!orderItem) {
+          return res.status(404).json({ message: "Bestellposition nicht gefunden" });
+        }
+        
+        const order = await storage.getOrderById(orderItem.orderId);
+        if (!order) {
+          return res.status(404).json({ message: "Bestellung nicht gefunden" });
+        }
+        
+        // Sicherheitsprüfung
+        if (order.userId !== req.user.id && req.user.role !== "admin") {
+          return res.status(403).json({ message: "Zugriff verweigert" });
+        }
+      }
+      
+      // Wenn es zu einem CartItem gehört, prüfen Sie den Warenkorb
+      if (image.cartItemId) {
+        const cartItems = await storage.getCartItems(image.cartItemId);
+        const cartItem = cartItems.find(ci => ci.id === image.cartItemId);
+        
+        if (!cartItem) {
+          return res.status(404).json({ message: "Warenkorb-Position nicht gefunden" });
+        }
+        
+        const cart = await storage.getActiveCart(req.user.id);
+        if (!cart || cart.id !== cartItem.cartId) {
+          return res.status(403).json({ message: "Zugriff verweigert" });
+        }
+      }
+      
+      // Setzen Sie dieses Bild als Hauptbild
+      const success = await storage.setMainProductImage(imageId);
+      
+      if (!success) {
+        return res.status(500).json({ message: "Bild konnte nicht als Hauptbild festgelegt werden" });
+      }
+      
+      res.json({ success: true });
+    } catch (error) {
+      res.status(500).json({ message: "Fehler beim Setzen des Hauptbilds" });
+    }
+  });
+
+  // Produktbild löschen
+  app.delete("/api/product-images/:id", isAuthenticated, async (req, res) => {
+    try {
+      const imageId = parseInt(req.params.id);
+      
+      // Bild abrufen
+      const image = await storage.getProductImage(imageId);
+      
+      if (!image) {
+        return res.status(404).json({ message: "Bild nicht gefunden" });
+      }
+      
+      // Wenn es zu einem OrderItem gehört, prüfen Sie die Bestellung
+      if (image.orderItemId) {
+        const orderItem = await storage.getOrderItem(image.orderItemId);
+        if (!orderItem) {
+          return res.status(404).json({ message: "Bestellposition nicht gefunden" });
+        }
+        
+        const order = await storage.getOrderById(orderItem.orderId);
+        if (!order) {
+          return res.status(404).json({ message: "Bestellung nicht gefunden" });
+        }
+        
+        // Sicherheitsprüfung
+        if (order.userId !== req.user.id && req.user.role !== "admin") {
+          return res.status(403).json({ message: "Zugriff verweigert" });
+        }
+        
+        // Prüfen, ob die Bestellung bereits abgeschlossen oder storniert ist
+        if (order.status === 'completed' || order.status === 'cancelled') {
+          return res.status(400).json({ 
+            message: `Bilder können nicht mehr gelöscht werden, da die Bestellung bereits ${
+              order.status === 'completed' ? 'abgeschlossen' : 'storniert'
+            } ist` 
+          });
+        }
+      }
+      
+      // Wenn es zu einem CartItem gehört, prüfen Sie den Warenkorb
+      if (image.cartItemId) {
+        const cartItems = await storage.getCartItems(image.cartItemId);
+        const cartItem = cartItems.find(ci => ci.id === image.cartItemId);
+        
+        if (!cartItem) {
+          return res.status(404).json({ message: "Warenkorb-Position nicht gefunden" });
+        }
+        
+        const cart = await storage.getActiveCart(req.user.id);
+        if (!cart || cart.id !== cartItem.cartId) {
+          return res.status(403).json({ message: "Zugriff verweigert" });
+        }
+      }
+      
+      // Physische Datei löschen, falls vorhanden
+      if (image.url && !image.url.startsWith('http')) {
+        try {
+          const filePath = path.join(process.cwd(), image.url);
+          if (fs.existsSync(filePath)) {
+            fs.unlinkSync(filePath);
+          }
+        } catch (err) {
+          console.error("Fehler beim Löschen der Bilddatei:", err);
+        }
+      }
+      
+      // Bild aus der Datenbank löschen
+      const deleted = await storage.deleteProductImage(imageId);
+      
+      if (!deleted) {
+        return res.status(500).json({ message: "Bild konnte nicht gelöscht werden" });
+      }
+      
+      res.json({ success: true });
+    } catch (error) {
+      res.status(500).json({ message: "Fehler beim Löschen des Bilds" });
+    }
+  });
+
+  // Admin-Routen
+  app.get("/api/admin/users", isAdmin, async (req, res) => {
+    try {
+      const users = await storage.getAllUsers();
+      
+      // Entfernen Sie sensible Informationen
+      const safeUsers = users.map(user => {
+        const { password, ...userWithoutPassword } = user;
+        return userWithoutPassword;
+      });
+      
+      res.json(safeUsers);
+    } catch (error) {
+      res.status(500).json({ message: "Fehler beim Abrufen der Benutzer" });
+    }
+  });
+
+  app.get("/api/admin/orders", isAdmin, async (req, res) => {
+    try {
+      const orders = await storage.getAllOrders();
+      res.json(orders);
+    } catch (error) {
+      res.status(500).json({ message: "Fehler beim Abrufen der Bestellungen" });
+    }
+  });
+
+  app.get("/api/admin/orders/all", isAdmin, async (req, res) => {
+    try {
+      const orders = await storage.getAllOrdersIncludingDeleted();
+      res.json(orders);
+    } catch (error) {
+      res.status(500).json({ message: "Fehler beim Abrufen aller Bestellungen" });
+    }
+  });
+  
+  // Wiederherstellung einer gelöschten Bestellung
+  app.post("/api/orders/:id/restore", isAdmin, async (req, res) => {
+    try {
+      const orderId = parseInt(req.params.id);
+      const restoredOrder = await storage.restoreOrder(orderId);
+      
+      if (!restoredOrder) {
+        return res.status(404).json({ 
+          message: "Die Bestellung konnte nicht gefunden oder wiederhergestellt werden." 
+        });
+      }
+      
+      // Benachrichtigung für den Kunden
+      await storage.createNotification({
+        userId: restoredOrder.userId,
+        type: "order_restored",
+        message: `Ihre Bestellung ${restoredOrder.orderNumber} wurde wiederhergestellt.`,
+        relatedOrderId: restoredOrder.id
+      });
+      
+      res.json({ 
+        message: `Bestellung ${restoredOrder.orderNumber} wurde erfolgreich wiederhergestellt.`,
+        order: restoredOrder 
+      });
+    } catch (error) {
+      console.error("Error restoring order:", error);
+      res.status(500).json({ message: "Fehler beim Wiederherstellen der Bestellung" });
+    }
+  });
+
+  app.patch("/api/admin/users/:id", isAdmin, async (req, res) => {
+    try {
+      const userId = parseInt(req.params.id);
+      const user = await storage.getUser(userId);
+      
+      if (!user) {
+        return res.status(404).json({ message: "Benutzer nicht gefunden" });
+      }
+      
+      // Validierung der Daten
+      const updateData = req.body;
+      delete updateData.id; // ID kann nicht geändert werden
+      
+      // Wenn ein neues Passwort gesetzt werden soll, müsste es hier gehashed werden
+      // In diesem Beispiel nicht implementiert
+      
+      const updatedUser = await storage.updateUser(userId, updateData);
+      
+      // Entfernen Sie sensible Informationen
+      const { password, ...safeUser } = updatedUser;
+      
+      res.json(safeUser);
+    } catch (error) {
+      res.status(500).json({ message: "Fehler beim Aktualisieren des Benutzers" });
+    }
+  });
+
+  // Bild-Upload-Route
+  app.post("/api/upload", isAuthenticated, upload.single('image'), (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ message: "Keine Datei hochgeladen" });
+      }
+      
+      // Vollständigen Pfad erstellen, der für den Client zugänglich ist
+      const filePath = `/uploads/products/${req.file.filename}`;
+      
+      res.json({ 
+        success: true, 
+        filePath,
+        // Fügen Sie vollständige URL hinzu, wenn erforderlich
+        url: `${req.protocol}://${req.get('host')}${filePath}`
+      });
+    } catch (error) {
+      res.status(500).json({ message: "Fehler beim Hochladen des Bildes" });
+    }
+  });
+
+  // Cart-Routen
+  app.get("/api/cart", isAuthenticated, async (req, res) => {
+    try {
+      let cart = await storage.getActiveCart(req.user.id);
+      
+      // Wenn kein aktiver Warenkorb existiert, erstellen Sie einen neuen
+      if (!cart) {
+        cart = await storage.createCart({
+          userId: req.user.id,
+          isActive: true,
+          createdAt: new Date(),
+          updatedAt: new Date()
+        });
+      }
+      
+      // Artikel im Warenkorb abrufen
+      const items = await storage.getCartItems(cart.id);
+      
+      // Für jedes CartItem die zugehörigen Bilder laden
+      const itemsWithImages = await Promise.all(items.map(async (item) => {
+        const images = await storage.getProductImagesByCartItemId(item.id);
+        return {
+          ...item,
+          images,
+          // Nur die URL der Bilder als String
+          imageUrl: convertImagesToMultiFormat(images)
+        };
+      }));
+      
+      res.json({
+        ...cart,
+        items: itemsWithImages
+      });
+    } catch (error) {
+      res.status(500).json({ message: "Fehler beim Abrufen des Warenkorbs" });
+    }
+  });
+
+  app.post("/api/cart/items", isAuthenticated, async (req, res) => {
+    try {
+      let cart = await storage.getActiveCart(req.user.id);
+      
+      // Wenn kein aktiver Warenkorb existiert, erstellen Sie einen neuen
+      if (!cart) {
+        cart = await storage.createCart({
+          userId: req.user.id,
+          isActive: true,
+          createdAt: new Date(),
+          updatedAt: new Date()
+        });
+      }
+      
+      // Artikel zum Warenkorb hinzufügen
+      const cartItem = await storage.addCartItem({
+        cartId: cart.id,
+        name: req.body.name,
+        description: req.body.description || null,
+        quantity: req.body.quantity || 1,
+        note: req.body.note || null,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      });
+      
+      // Bilder speichern, falls vorhanden
+      if (req.body.imageUrl) {
+        await imageService.saveImagesForCartItem(cartItem.id, req.body.imageUrl);
+      }
+      
+      // Warenkorb aktualisieren (Zeitstempel)
+      await storage.updateCart(cart.id, {
+        updatedAt: new Date()
+      });
+      
+      // Bilder für das CartItem laden
+      const images = await storage.getProductImagesByCartItemId(cartItem.id);
+      
+      res.status(201).json({
+        ...cartItem,
+        images,
+        imageUrl: convertImagesToMultiFormat(images)
+      });
+    } catch (error) {
+      res.status(500).json({ message: "Fehler beim Hinzufügen des Artikels zum Warenkorb" });
+    }
+  });
+
+  app.delete("/api/cart/items/:id", isAuthenticated, async (req, res) => {
+    try {
+      const itemId = parseInt(req.params.id);
+      
+      // Warenkorb und Artikel prüfen
+      const cart = await storage.getActiveCart(req.user.id);
+      
+      if (!cart) {
+        return res.status(404).json({ message: "Warenkorb nicht gefunden" });
+      }
+      
+      // Artikel entfernen
+      const removed = await storage.removeCartItem(itemId);
+      
+      if (!removed) {
+        return res.status(500).json({ message: "Artikel konnte nicht aus dem Warenkorb entfernt werden" });
+      }
+      
+      // Warenkorb aktualisieren (Zeitstempel)
+      await storage.updateCart(cart.id, {
+        updatedAt: new Date()
+      });
+      
+      res.json({ success: true });
+    } catch (error) {
+      res.status(500).json({ message: "Fehler beim Entfernen des Artikels aus dem Warenkorb" });
+    }
+  });
+
+  app.delete("/api/cart", isAuthenticated, async (req, res) => {
+    try {
+      const cart = await storage.getActiveCart(req.user.id);
+      
+      if (!cart) {
+        return res.status(404).json({ message: "Warenkorb nicht gefunden" });
+      }
+      
+      // Warenkorb leeren
+      const cleared = await storage.clearCart(cart.id);
+      
+      if (!cleared) {
+        return res.status(500).json({ message: "Warenkorb konnte nicht geleert werden" });
+      }
+      
+      // Warenkorb aktualisieren (Zeitstempel)
+      await storage.updateCart(cart.id, {
+        updatedAt: new Date()
+      });
+      
+      res.json({ success: true });
+    } catch (error) {
+      res.status(500).json({ message: "Fehler beim Leeren des Warenkorbs" });
+    }
+  });
+
+  // OrderDraft-Routen für die Speicherung des Formularstatus
+  app.get("/api/order-draft", isAuthenticated, async (req, res) => {
+    try {
+      const draft = await storage.getOrderDraft(req.user.id);
+      
+      if (!draft) {
+        return res.status(404).json({ message: "Kein Entwurf gefunden" });
+      }
+      
+      res.json(draft);
+    } catch (error) {
+      res.status(500).json({ message: "Fehler beim Abrufen des Entwurfs" });
+    }
+  });
+
+  app.post("/api/order-draft", isAuthenticated, async (req, res) => {
+    try {
+      // Vorhandenen Entwurf suchen
+      const existingDraft = await storage.getOrderDraft(req.user.id);
+      
+      if (existingDraft) {
+        // Aktualisieren statt erstellen
+        const updatedDraft = await storage.updateOrderDraft(req.user.id, {
+          draftData: req.body.draftData,
+          step: req.body.step,
+          updatedAt: new Date()
+        });
+        
+        return res.json(updatedDraft);
+      }
+      
+      // Neuen Entwurf erstellen
+      const draft = await storage.saveOrderDraft({
+        userId: req.user.id,
+        draftData: req.body.draftData,
+        step: req.body.step,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      });
+      
+      res.status(201).json(draft);
+    } catch (error) {
+      res.status(500).json({ message: "Fehler beim Speichern des Entwurfs" });
+    }
+  });
+
+  app.patch("/api/order-draft", isAuthenticated, async (req, res) => {
+    try {
+      // Vorhandenen Entwurf suchen
+      const existingDraft = await storage.getOrderDraft(req.user.id);
+      
+      if (!existingDraft) {
+        return res.status(404).json({ message: "Kein Entwurf gefunden" });
+      }
+      
+      // Entwurf aktualisieren
+      const updatedDraft = await storage.updateOrderDraft(req.user.id, {
+        draftData: req.body.draftData,
+        step: req.body.step,
+        updatedAt: new Date()
+      });
+      
+      res.json(updatedDraft);
+    } catch (error) {
+      res.status(500).json({ message: "Fehler beim Aktualisieren des Entwurfs" });
+    }
+  });
+
+  app.delete("/api/order-draft", isAuthenticated, async (req, res) => {
+    try {
+      const deleted = await storage.deleteOrderDraft(req.user.id);
+      
+      if (!deleted) {
+        return res.status(500).json({ message: "Entwurf konnte nicht gelöscht werden" });
+      }
+      
+      res.json({ success: true });
+    } catch (error) {
+      res.status(500).json({ message: "Fehler beim Löschen des Entwurfs" });
+    }
+  });
+
+  // Add new endpoints for delivery date negotiation
+  app.post("/api/admin/orders/:id/force-date", isAdmin, async (req, res) => {
+    try {
+      const orderId = parseInt(req.params.id);
+      const order = await storage.getOrderById(orderId);
+      
+      if (!order) {
+        return res.status(404).json({ message: "Order not found" });
+      }
+      
+      const { finalDeliveryDate, finalTimeSlot } = req.body;
+      
+      if (!finalDeliveryDate || !finalTimeSlot) {
+        return res.status(400).json({ message: "Date and time slot are required" });
+      }
+      
+      // Update order with forced date and lock it
+      const updatedOrder = await storage.updateOrder(orderId, {
+        finalDeliveryDate: new Date(finalDeliveryDate),
+        finalTimeSlot,
+        status: 'date_forced',
+        isLocked: true // Verhindert weitere Änderungen
+      });
+      
+      // Notify customer
+      await storage.createNotification({
+        userId: order.userId,
+        type: "date_forced",
+        message: `Der Administrator hat einen verbindlichen Liefertermin für Ihre Bestellung ${order.orderNumber} festgelegt.`,
+        relatedOrderId: order.id
+      });
+      
+      res.json(updatedOrder);
+    } catch (error) {
+      res.status(500).json({ message: "Error forcing delivery date" });
+    }
+  });
+
+  app.post("/api/admin/orders/:id/suggest-date", isAdmin, async (req, res) => {
+    try {
+      const orderId = parseInt(req.params.id);
+      const order = await storage.getOrderById(orderId);
+      
+      if (!order) {
+        return res.status(404).json({ message: "Order not found" });
+      }
+      
+      const { suggestedDate, suggestedTimeSlot } = req.body;
+      
+      if (!suggestedDate || !suggestedTimeSlot) {
+        return res.status(400).json({ message: "Date and time slot are required" });
+      }
+      
+      // Update order with suggested date
+      const updatedOrder = await storage.updateOrder(orderId, {
+        suggestedDeliveryDate: new Date(suggestedDate),
+        suggestedTimeSlot,
+        status: 'pending_customer_review'
+      });
+      
+      // Notify customer
+      await storage.createNotification({
+        userId: order.userId,
+        type: "date_suggested",
+        message: `Ein alternativer Liefertermin wurde für Ihre Bestellung ${order.orderNumber} vorgeschlagen.`,
+        relatedOrderId: order.id
+      });
+      
+      res.json(updatedOrder);
+    } catch (error) {
+      res.status(500).json({ message: "Error suggesting delivery date" });
+    }
+  });
+
+  app.post("/api/orders/:id/accept-date", isAuthenticated, async (req, res) => {
+    try {
+      const orderId = parseInt(req.params.id);
+      const order = await storage.getOrderById(orderId);
+      
+      if (!order) {
+        return res.status(404).json({ message: "Order not found" });
+      }
+      
+      if (order.userId !== req.user.id) {
+        return res.status(403).json({ message: "Forbidden" });
+      }
+      
+      if (!order.suggestedDeliveryDate || !order.suggestedTimeSlot) {
+        return res.status(400).json({ message: "No suggested date to accept" });
+      }
+      
+      // Update order with accepted date and set as final
+      const updatedOrder = await storage.updateOrder(orderId, {
+        finalDeliveryDate: order.suggestedDeliveryDate,
+        finalTimeSlot: order.suggestedTimeSlot,
+        status: 'date_accepted',
+        isLocked: false // Ermöglicht weitere Änderungen
+      });
+      
+      // Notify admin
+      const admins = (await storage.getAllUsers()).filter(user => user.role === "admin");
+      for (const admin of admins) {
+        await storage.createNotification({
+          userId: admin.id,
+          type: "date_accepted",
+          message: `Der Kunde hat den vorgeschlagenen Liefertermin für Bestellung ${order.orderNumber} akzeptiert.`,
+          relatedOrderId: order.id
+        });
+      }
+      
+      res.json(updatedOrder);
+    } catch (error) {
+      res.status(500).json({ message: "Error accepting delivery date" });
+    }
+  });
+
+  app.post("/api/admin/orders/:id/accept-customer-date", isAdmin, async (req, res) => {
+    try {
+      const orderId = parseInt(req.params.id);
+      const order = await storage.getOrderById(orderId);
+      
+      if (!order) {
+        return res.status(404).json({ message: "Order not found" });
+      }
+      
+      if (!order.desiredDeliveryDate || !order.desiredTimeSlot) {
+        return res.status(400).json({ message: "No desired date to accept" });
+      }
+      
+      // Update order with accepted customer date and set as final
+      const updatedOrder = await storage.updateOrder(orderId, {
+        finalDeliveryDate: order.desiredDeliveryDate,
+        finalTimeSlot: order.desiredTimeSlot,
+        status: 'date_confirmed',
+        isLocked: true // Lock the order
+      });
+      
+      // Notify customer
+      await storage.createNotification({
+        userId: order.userId,
+        type: "date_confirmed",
+        message: `Ihr gewünschter Liefertermin für Bestellung ${order.orderNumber} wurde bestätigt.`,
+        relatedOrderId: order.id
+      });
+      
+      res.json(updatedOrder);
+    } catch (error) {
+      res.status(500).json({ message: "Error accepting customer date" });
+    }
+  });
+
+  app.post("/api/orders/:id/reject-date", isAuthenticated, async (req, res) => {
+    try {
+      const orderId = parseInt(req.params.id);
+      const order = await storage.getOrderById(orderId);
+      
+      if (!order) {
+        return res.status(404).json({ message: "Order not found" });
+      }
+      
+      if (order.userId !== req.user.id) {
+        return res.status(403).json({ message: "Forbidden" });
+      }
+      
+      const { alternativeDate, alternativeTimeSlot, reason } = req.body;
+      
+      // Update order with customer counter-proposal
+      const updateData: any = {
+        status: 'pending_admin_review'
+      };
+      
+      if (alternativeDate && alternativeTimeSlot) {
+        updateData.desiredDeliveryDate = new Date(alternativeDate);
+        updateData.desiredTimeSlot = alternativeTimeSlot;
+      }
+      
+      const updatedOrder = await storage.updateOrder(orderId, updateData);
+      
+      // Notify admin
+      const admins = (await storage.getAllUsers()).filter(user => user.role === "admin");
+      for (const admin of admins) {
+        await storage.createNotification({
+          userId: admin.id,
+          type: "date_rejected",
+          message: `Der Kunde hat den vorgeschlagenen Liefertermin für Bestellung ${order.orderNumber} abgelehnt${reason ? `: "${reason}"` : '.'}`,
+          relatedOrderId: order.id
+        });
+      }
+      
+      res.json(updatedOrder);
+    } catch (error) {
+      res.status(500).json({ message: "Error rejecting delivery date" });
+    }
+  });
+
+  // Diese Funktion aktualisiert den Order-Status von "processing" zu "in_delivery" 
+  // und benachrichtigt den Kunden
+  // TODO: Hier spätere Lieferplattform-API integrieren
+  app.post("/api/admin/orders/:id/start-delivery", isAdmin, async (req, res) => {
+    try {
+      const orderId = parseInt(req.params.id);
+      const order = await storage.getOrderById(orderId);
+      
+      if (!order) {
+        return res.status(404).json({ message: "Order not found" });
+      }
+      
+      if (order.status !== 'processing' && order.status !== 'date_confirmed' && order.status !== 'date_forced') {
+        return res.status(400).json({ 
+          message: `Die Bestellung kann nicht in Lieferung gehen, da sie sich im Status '${order.status}' befindet` 
+        });
+      }
+      
+      // Update order status
+      const updatedOrder = await storage.updateOrder(orderId, {
+        status: 'in_delivery'
+      });
+      
+      // Notify customer
+      await storage.createNotification({
+        userId: order.userId,
+        type: "delivery_started",
+        message: `Ihre Bestellung ${order.orderNumber} ist jetzt auf dem Weg zu Ihnen!`,
+        relatedOrderId: order.id
+      });
+      
+      res.json(updatedOrder);
+    } catch (error) {
+      res.status(500).json({ message: "Error starting delivery" });
+    }
+  });
+
+  // Diese Funktion markiert eine Bestellung als geliefert
+  app.post("/api/admin/orders/:id/complete-delivery", isAdmin, async (req, res) => {
+    try {
+      const orderId = parseInt(req.params.id);
+      const order = await storage.getOrderById(orderId);
+      
+      if (!order) {
+        return res.status(404).json({ message: "Order not found" });
+      }
+      
+      // Update order status to completed
+      const updatedOrder = await storage.updateOrder(orderId, {
+        status: 'completed',
+        completedAt: new Date()
+      });
+      
+      // Notify customer
+      await storage.createNotification({
+        userId: order.userId,
+        type: "delivery_completed",
+        message: `Ihre Bestellung ${order.orderNumber} wurde erfolgreich zugestellt. Vielen Dank für Ihren Einkauf!`,
+        relatedOrderId: order.id
+      });
+      
+      res.json(updatedOrder);
+    } catch (error) {
+      res.status(500).json({ message: "Error completing delivery" });
+    }
+  });
+
+  // Hilfsfunktion für Admins, um eine Benutzerbenachrichtigung zu erstellen
+  app.post("/api/admin/notifications", isAdmin, async (req, res) => {
+    try {
+      const { userId, message, type, relatedOrderId } = req.body;
+      
+      if (!userId || !message) {
+        return res.status(400).json({ message: "Benutzer-ID und Nachricht sind erforderlich" });
+      }
+      
+      const user = await storage.getUser(userId);
+      if (!user) {
+        return res.status(404).json({ message: "Benutzer nicht gefunden" });
+      }
+      
+      const notification = await storage.createNotification({
+        userId,
+        message,
+        type: type || "admin_message",
+        relatedOrderId: relatedOrderId || null
+      });
+      
+      res.status(201).json(notification);
+    } catch (error) {
+      res.status(500).json({ message: "Fehler beim Erstellen der Benachrichtigung" });
+    }
+  });
+
+  // Globale Benachrichtigung an alle Benutzer (z.B. für Wartungsarbeiten oder Ankündigungen)
+  app.post("/api/admin/notifications/global", isAdmin, async (req, res) => {
+    try {
+      const { message, type } = req.body;
+      
+      if (!message) {
+        return res.status(400).json({ message: "Nachricht ist erforderlich" });
+      }
+      
+      // Alle Benutzer abrufen
+      const users = await storage.getAllUsers();
+      
+      // Für jeden Benutzer eine Benachrichtigung erstellen
+      const notifications = [];
+      for (const user of users) {
+        const notification = await storage.createNotification({
+          userId: user.id,
+          message,
+          type: type || "global_announcement"
+        });
+        notifications.push(notification);
+      }
+      
+      res.status(201).json({ 
+        success: true, 
+        count: notifications.length,
+        message: `${notifications.length} Benachrichtigungen wurden erstellt`
+      });
+    } catch (error) {
+      res.status(500).json({ message: "Fehler beim Erstellen der globalen Benachrichtigungen" });
+    }
+  });
+
+  // Diagnostik-Endpunkte für Debugging
+  if (process.env.NODE_ENV !== 'production') {
+    app.get("/api/debug/db-connection", isAdmin, async (req, res) => {
+      try {
+        // Test the database connection
+        const result = await db.execute(sql`SELECT NOW() as time`);
+        res.json({ 
+          success: true, 
+          message: "Database connection successful", 
+          timestamp: result[0]?.time || new Date() 
+        });
+      } catch (error) {
+        console.error("Database connection error:", error);
+        res.status(500).json({ 
+          success: false, 
+          message: "Database connection failed", 
+          error: String(error)
+        });
+      }
+    });
+
+    app.get("/api/debug/server-info", isAdmin, (req, res) => {
+      res.json({
+        nodeVersion: process.version,
+        platform: process.platform,
+        memoryUsage: process.memoryUsage(),
+        uptime: process.uptime(),
+        env: process.env.NODE_ENV
+      });
+    });
+  }
+
+  return server;
+}

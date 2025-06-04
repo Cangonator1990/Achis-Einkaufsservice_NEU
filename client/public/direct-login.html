@@ -1,0 +1,484 @@
+<!DOCTYPE html>
+<html lang="de">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Achis Einkaufservice - Direkter Login</title>
+    <style>
+      body {
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+        line-height: 1.5;
+        color: #333;
+        background-color: #f5f5f5;
+        margin: 0;
+        padding: 0;
+      }
+      
+      .header {
+        background-color: #3182ce;
+        color: white;
+        padding: 20px;
+        text-align: center;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+      }
+
+      .logo {
+        max-width: 200px;
+        margin: 0 auto;
+        display: block;
+      }
+      
+      .container {
+        max-width: 500px;
+        width: 100%;
+        margin: 0 auto;
+        padding: 40px 20px;
+      }
+      
+      .card {
+        background-color: white;
+        border-radius: 8px;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        padding: 20px;
+        margin-bottom: 20px;
+      }
+      
+      h1 {
+        font-size: 24px;
+        margin-bottom: 20px;
+        color: #3182ce;
+      }
+
+      h2 {
+        font-size: 20px;
+        margin-bottom: 15px;
+        color: #2c5282;
+      }
+      
+      p {
+        margin-bottom: 15px;
+      }
+
+      form {
+        margin-top: 20px;
+      }
+      
+      .form-group {
+        margin-bottom: 20px;
+      }
+      
+      label {
+        display: block;
+        margin-bottom: 5px;
+        font-weight: 500;
+      }
+      
+      input {
+        width: 100%;
+        padding: 10px;
+        border: 1px solid #ddd;
+        border-radius: 4px;
+        font-size: 16px;
+      }
+      
+      .error-message {
+        color: #e53e3e;
+        margin-top: 5px;
+        font-size: 14px;
+      }
+      
+      .button {
+        display: inline-block;
+        background-color: #3182ce;
+        color: white;
+        padding: 10px 20px;
+        border-radius: 4px;
+        text-decoration: none;
+        font-weight: 500;
+        border: none;
+        cursor: pointer;
+        font-size: 16px;
+        width: 100%;
+      }
+      
+      .button:hover {
+        background-color: #2c5282;
+      }
+      
+      .info-text {
+        background-color: #ebf8ff;
+        border: 1px solid #90cdf4;
+        border-radius: 4px;
+        padding: 10px;
+        margin-top: 20px;
+        font-size: 14px;
+      }
+      
+      .success-box {
+        background-color: #f0fff4;
+        border: 1px solid #68d391;
+        border-radius: 4px;
+        padding: 15px;
+        margin-top: 20px;
+        display: none;
+      }
+      
+      .loader {
+        border: 4px solid #f3f3f3;
+        border-radius: 50%;
+        border-top: 4px solid #3182ce;
+        width: 20px;
+        height: 20px;
+        animation: spin 1s linear infinite;
+        display: inline-block;
+        margin-right: 10px;
+        vertical-align: middle;
+      }
+      
+      @keyframes spin {
+        0% { transform: rotate(0deg); }
+        100% { transform: rotate(360deg); }
+      }
+      
+      .footer {
+        background-color: #2c5282;
+        color: white;
+        padding: 20px;
+        text-align: center;
+        margin-top: 40px;
+      }
+      
+      /* Status-Anzeigen */
+      .status-container {
+        margin-top: 30px;
+        padding: 15px;
+        background-color: #f8fafc;
+        border-radius: 8px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+      }
+      
+      .status-item {
+        display: flex;
+        align-items: center;
+        padding: 10px 0;
+        border-bottom: 1px solid #e2e8f0;
+      }
+      
+      .status-item:last-child {
+        border-bottom: none;
+      }
+      
+      .status-icon {
+        margin-right: 10px;
+        font-size: 20px;
+      }
+      
+      .status-text {
+        flex-grow: 1;
+      }
+      
+      .status-unknown {
+        color: #a0aec0;
+      }
+      
+      .status-success {
+        color: #38a169;
+      }
+      
+      .status-error {
+        color: #e53e3e;
+      }
+      
+      .status-warning {
+        color: #d69e2e;
+      }
+
+      @media (max-width: 600px) {
+        .container {
+          padding: 20px 10px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="header">
+      <h1>Achis Einkaufservice</h1>
+      <p>Direkter Zugang im Notfall-Modus</p>
+    </div>
+
+    <div class="container">
+      <div class="card">
+        <h2>Bitte melden Sie sich an</h2>
+        <p>Verwenden Sie Ihre Anmeldedaten, um sich auch im Notfall-Modus anzumelden.</p>
+        
+        <form id="login-form">
+          <div class="form-group">
+            <label for="username">Benutzername</label>
+            <input type="text" id="username" name="username" required>
+            <div class="error-message" id="username-error"></div>
+          </div>
+          
+          <div class="form-group">
+            <label for="password">Passwort</label>
+            <input type="password" id="password" name="password" required>
+            <div class="error-message" id="password-error"></div>
+          </div>
+          
+          <button type="submit" class="button" id="login-button">
+            <span id="loading-spinner" style="display: none;" class="loader"></span>
+            Anmelden
+          </button>
+          
+          <div class="error-message" id="login-error"></div>
+        </form>
+        
+        <div class="success-box" id="login-success">
+          <strong>Anmeldung erfolgreich!</strong>
+          <p>Sie sind jetzt angemeldet.</p>
+          <p><a href="/" class="button" style="display: inline-block; width: auto;">Zur Startseite</a></p>
+        </div>
+        
+        <div class="info-text">
+          <strong>Hinweis:</strong> Diese Seite verwendet eine direkte API-Verbindung und umgeht die normale Anwendungslogik.
+        </div>
+      </div>
+      
+      <div class="status-container">
+        <h3>Systemstatus</h3>
+        
+        <div class="status-item">
+          <span class="status-icon status-unknown" id="api-status-icon">●</span>
+          <span class="status-text">API-Verbindung: <span id="api-status">Wird geprüft...</span></span>
+        </div>
+        
+        <div class="status-item">
+          <span class="status-icon status-unknown" id="db-status-icon">●</span>
+          <span class="status-text">Datenbank: <span id="db-status">Wird geprüft...</span></span>
+        </div>
+        
+        <div class="status-item">
+          <span class="status-icon status-unknown" id="auth-status-icon">●</span>
+          <span class="status-text">Authentifizierung: <span id="auth-status">Wird geprüft...</span></span>
+        </div>
+      </div>
+    </div>
+
+    <div class="footer">
+      <p>© 2025 Achis Einkaufservice | Kontakt: info@achis-einkauf.de | Tel: +49 123 456789</p>
+    </div>
+    
+    <script>
+      // API-Endpunkte
+      const API_ENDPOINTS = {
+        health: '/api/health-direct',
+        dbHealth: '/api/db-health-direct',
+        login: '/api/login-direct',
+        authCheck: '/api/auth-check-direct'
+      };
+      
+      // Status-Aktualisierungsfunktionen
+      function updateStatus(element, status, message, type) {
+        const iconElement = document.getElementById(`${element}-status-icon`);
+        const textElement = document.getElementById(`${element}-status`);
+        
+        // Icon aktualisieren
+        iconElement.className = `status-icon status-${type}`;
+        
+        // Text aktualisieren
+        textElement.textContent = message;
+      }
+      
+      // Status-Checks durchführen
+      async function checkAPIStatus() {
+        try {
+          const response = await fetch(API_ENDPOINTS.health, {
+            method: 'GET',
+            headers: { 'Accept': 'application/json' },
+            cache: 'no-store'
+          });
+          
+          if (response.ok) {
+            const data = await response.json();
+            updateStatus('api', 'success', `Verbunden (${data.source})`, 'success');
+            return true;
+          } else {
+            updateStatus('api', 'error', `Fehler: ${response.status}`, 'error');
+            return false;
+          }
+        } catch (error) {
+          updateStatus('api', 'error', `Verbindungsfehler: ${error.message}`, 'error');
+          return false;
+        }
+      }
+      
+      async function checkDBStatus() {
+        try {
+          const response = await fetch(API_ENDPOINTS.dbHealth, {
+            method: 'GET',
+            headers: { 'Accept': 'application/json' },
+            cache: 'no-store',
+            // Setzen von Timeout
+            signal: AbortSignal.timeout(3000) // 3 Sekunden Timeout
+          });
+          
+          if (response.ok) {
+            const data = await response.json();
+            if (data.status === 'UP') {
+              updateStatus('db', 'success', 'Verbunden', 'success');
+              return true;
+            } else {
+              updateStatus('db', 'error', `Problem: ${data.message || data.status}`, 'warning');
+              return false;
+            }
+          } else {
+            updateStatus('db', 'error', `Fehler: ${response.status}`, 'error');
+            return false;
+          }
+        } catch (error) {
+          if (error.name === 'TimeoutError' || error.name === 'AbortError') {
+            updateStatus('db', 'error', 'Timeout bei Verbindungsversuch', 'warning');
+          } else {
+            updateStatus('db', 'error', `Verbindungsfehler: ${error.message}`, 'error');
+          }
+          return false;
+        }
+      }
+      
+      async function checkAuthStatus() {
+        try {
+          const response = await fetch(API_ENDPOINTS.authCheck, {
+            method: 'GET',
+            headers: { 'Accept': 'application/json' },
+            credentials: 'include',
+            cache: 'no-store'
+          });
+          
+          if (response.ok) {
+            const data = await response.json();
+            if (data.authenticated) {
+              updateStatus('auth', 'success', `Angemeldet als ${data.role}`, 'success');
+              document.getElementById('login-form').style.display = 'none';
+              document.getElementById('login-success').style.display = 'block';
+              return true;
+            } else {
+              updateStatus('auth', 'warning', 'Nicht angemeldet', 'warning');
+              return false;
+            }
+          } else if (response.status === 401) {
+            updateStatus('auth', 'warning', 'Nicht angemeldet', 'warning');
+            return false;
+          } else {
+            updateStatus('auth', 'error', `Fehler: ${response.status}`, 'error');
+            return false;
+          }
+        } catch (error) {
+          updateStatus('auth', 'error', `Verbindungsfehler: ${error.message}`, 'error');
+          return false;
+        }
+      }
+      
+      // Login-Funktionalität
+      document.getElementById('login-form').addEventListener('submit', async function(event) {
+        event.preventDefault();
+        
+        // UI aktualisieren
+        const loginButton = document.getElementById('login-button');
+        const loginSpinner = document.getElementById('loading-spinner');
+        const loginError = document.getElementById('login-error');
+        const usernameError = document.getElementById('username-error');
+        const passwordError = document.getElementById('password-error');
+        
+        // Fehler zurücksetzen
+        loginError.textContent = '';
+        usernameError.textContent = '';
+        passwordError.textContent = '';
+        
+        // Loading-Zustand anzeigen
+        loginButton.disabled = true;
+        loginSpinner.style.display = 'inline-block';
+        loginButton.textContent = ' Anmeldung läuft...';
+        loginButton.prepend(loginSpinner);
+        
+        // Formularwerte auslesen
+        const username = document.getElementById('username').value;
+        const password = document.getElementById('password').value;
+        
+        // Basische Validierung
+        let hasError = false;
+        if (!username) {
+          usernameError.textContent = 'Bitte geben Sie Ihren Benutzernamen ein';
+          hasError = true;
+        }
+        if (!password) {
+          passwordError.textContent = 'Bitte geben Sie Ihr Passwort ein';
+          hasError = true;
+        }
+        
+        if (hasError) {
+          loginButton.disabled = false;
+          loginSpinner.style.display = 'none';
+          loginButton.textContent = 'Anmelden';
+          return;
+        }
+        
+        try {
+          // Login-Anfrage senden
+          const response = await fetch(API_ENDPOINTS.login, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Accept': 'application/json'
+            },
+            credentials: 'include',
+            body: JSON.stringify({ username, password })
+          });
+          
+          // Antwort verarbeiten
+          if (response.ok) {
+            // Erfolgreicher Login
+            const data = await response.json();
+            document.getElementById('login-form').style.display = 'none';
+            document.getElementById('login-success').style.display = 'block';
+            
+            // Auth-Status aktualisieren
+            updateStatus('auth', 'success', `Angemeldet als ${data.user.role}`, 'success');
+            
+            // Nach 2 Sekunden zur Startseite weiterleiten
+            setTimeout(() => {
+              window.location.href = '/';
+            }, 2000);
+          } else {
+            // Fehler verarbeiten
+            const errorData = await response.json().catch(() => ({}));
+            if (response.status === 401) {
+              loginError.textContent = errorData.error || 'Ungültiger Benutzername oder Passwort';
+            } else if (response.status === 403) {
+              loginError.textContent = errorData.error || 'Konto deaktiviert';
+            } else {
+              loginError.textContent = errorData.error || `Serverfehler (${response.status})`;
+            }
+          }
+        } catch (error) {
+          loginError.textContent = `Verbindungsfehler: ${error.message}`;
+        } finally {
+          // UI zurücksetzen
+          loginButton.disabled = false;
+          loginSpinner.style.display = 'none';
+          loginButton.textContent = 'Anmelden';
+        }
+      });
+      
+      // Beim Laden der Seite Status-Checks durchführen
+      window.addEventListener('DOMContentLoaded', async () => {
+        // Checks parallel ausführen
+        await Promise.all([
+          checkAPIStatus(),
+          // DB-Check mit einem kleinen Delay, um die API nicht zu überlasten
+          new Promise(resolve => setTimeout(() => resolve(checkDBStatus()), 500)),
+          // Auth-Check am Ende
+          new Promise(resolve => setTimeout(() => resolve(checkAuthStatus()), 1000))
+        ]);
+      });
+    </script>
+  </body>
+</html>

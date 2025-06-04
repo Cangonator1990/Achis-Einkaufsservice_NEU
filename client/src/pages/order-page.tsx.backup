@@ -1,0 +1,771 @@
+import { useState, useEffect } from 'react';
+import { useQuery, useMutation } from '@tanstack/react-query';
+import { useForm } from 'react-hook-form';
+import { z } from 'zod';
+import { useToast } from '@/hooks/use-toast';
+import { timeSlotSchema } from '@shared/schema';
+import type { Address, InsertOrderItem, TimeSlot, OrderDraft } from '@shared/schema';
+import { apiRequest, queryClient } from '@/lib/queryClient';
+
+// Erweiterte Typdefinition für OrderDraft mit orderItems
+// Klare Definition von OrderDraft und ExtendedOrderDraft für bessere Typprüfung
+interface OrderDraftItem {
+  productName: string;
+  quantity: string;
+  notes?: string;
+  store?: string;
+  imageUrl?: string;
+  filePath?: string;
+}
+
+// Definieren Sie das vollständige ExtendedOrderDraft mit allen möglichen Eigenschaften
+interface ExtendedOrderDraft {
+  id?: number;
+  userId?: number;
+  addressId?: number;
+  desiredDeliveryDate?: string | Date;
+  desiredTimeSlot?: TimeSlot;
+  additionalInstructions?: string;
+  store?: string;
+  orderItems?: OrderDraftItem[];
+}
+
+// Schritte für den Bestellprozess
+enum OrderStep {
+  Store = 0,      // Zuerst Filiale auswählen
+  Products = 1,   // Dann Produkte hinzufügen
+  Delivery = 2,   // Lieferdetails festlegen
+  Review = 3      // Bestellung prüfen und absenden
+}
+import { useCart } from '@/lib/CartProvider';
+import { useAuth } from '@/hooks/use-auth';
+import MainLayout from '@/layouts/MainLayout';
+import {
+  Form,
+  FormControl,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+  FormDescription
+} from '@/components/ui/form';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Textarea } from '@/components/ui/textarea';
+import {
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  CardDescription,
+} from '@/components/ui/card';
+import ProductEntryForm from '@/components/ProductEntryForm';
+import { format } from 'date-fns';
+import { de } from 'date-fns/locale';
+import { useLocation } from 'wouter';
+import { Trash2, CalendarIcon, Loader2, ShoppingCart } from 'lucide-react';
+import { cn } from "@/lib/utils";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
+import { Calendar } from "@/components/ui/calendar";
+import { Link } from 'wouter';
+
+const orderFormSchema = z.object({
+  addressId: z.number({
+    required_error: "Bitte wählen Sie eine Lieferadresse",
+  }),
+  desiredDeliveryDate: z.date({
+    required_error: "Bitte wählen Sie ein Lieferdatum",
+  }),
+  desiredTimeSlot: timeSlotSchema,
+  additionalInstructions: z.string().optional(),
+  // Filiale-Feld wurde in das Produktformular verschoben
+  orderItems: z.array(z.any()).optional(),
+});
+
+type OrderFormValues = z.infer<typeof orderFormSchema>;
+
+export default function OrderPage() {
+  const { toast } = useToast();
+  const [, navigate] = useLocation();
+  const [orderItems, setOrderItems] = useState<InsertOrderItem[]>([]);
+  const [storeValue, setStoreValue] = useState<string>('');
+  const { cart, isLoading: cartLoading, clearCart, saveCart } = useCart();
+  const { isAuthenticated } = useAuth();
+  const [hasSetStoreFromCart, setHasSetStoreFromCart] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [loadingInitialState, setLoadingInitialState] = useState(true);
+  const [calendarOpen, setCalendarOpen] = useState(false);
+
+  // Get user addresses
+  const { data: addresses = [], isLoading: isLoadingAddresses } = useQuery<Address[]>({
+    queryKey: ['/api/addresses'],
+  });
+  
+  // Lade den gespeicherten Formularentwurf mit erweitertem Typ und verbesserten Optionen
+  const { 
+    data: orderDraft, 
+    isLoading: isLoadingDraft,
+    refetch: refetchOrderDraft 
+  } = useQuery<ExtendedOrderDraft>({
+    queryKey: ['/api/order-draft'],
+    enabled: isAuthenticated,
+    // Immer neu laden, wenn die Komponente angezeigt wird
+    staleTime: 0,
+    // Parameter in React Query v5 für Cache-Zeit geändert
+    gcTime: 0,
+    // Immer frisch vom Server holen
+    refetchOnMount: 'always', 
+    refetchOnWindowFocus: true,
+  });
+
+  // Mutation to delete order draft
+  const deleteOrderDraftMutation = useMutation({
+    mutationFn: async () => {
+      if (!isAuthenticated) return;
+      
+      await apiRequest('/api/order-draft', {
+        method: 'DELETE'
+      });
+      
+      return true;
+    }
+  });
+
+  // Form
+  const form = useForm<OrderFormValues>({
+    defaultValues: {
+      additionalInstructions: '',
+      // Store wurde entfernt, da es jetzt Teil des Produktformulars ist
+    }
+  });
+  
+  const { handleSubmit, getValues, control } = form;
+
+  // Überprüft, ob der Warenkorb leer ist
+  // Wichtig: Dank der Verbesserungen in CartProvider ist cart nie undefined
+  const hasCartItems = cart.items.length > 0;
+  const cartIsEmpty = !hasCartItems; // Zeigt "Warenkorb ist leer" an, wenn keine Artikel im Warenkorb sind
+
+  // Extract functions - verbesserte Version mit Cache-Invalidierung
+  const saveFormState = async (values: Partial<OrderFormValues>) => {
+    if (!isAuthenticated) return;
+    
+    try {
+      // Speichere Daten auf dem Server
+      const response = await apiRequest('/api/order-draft', {
+        method: 'POST',
+        body: JSON.stringify(values)
+      });
+      
+      // Nach dem Speichern der Daten auf dem Server den Cache aktualisieren,
+      // damit die Daten beim nächsten Zugriff sofort verfügbar sind
+      queryClient.invalidateQueries({ queryKey: ['/api/order-draft'] });
+      
+      // Optional: Manuelles Refetch
+      await refetchOrderDraft();
+      
+      console.log("Formularstatus erfolgreich gespeichert und Cache aktualisiert");
+      return response;
+    } catch (error) {
+      console.error("Error saving form state:", error);
+      toast({
+        title: "Fehler",
+        description: "Formularstatus konnte nicht gespeichert werden.",
+        variant: "destructive"
+      });
+    }
+  };
+
+  // Effekt, um den gespeicherten Formularentwurf zu laden - verbesserte Version
+  useEffect(() => {
+    if (isLoadingDraft) {
+      console.log("Formularentwurf wird geladen...");
+      return;
+    }
+
+    if (orderDraft && Object.keys(orderDraft).length > 0) {
+      console.log("Formularentwurf geladen:", orderDraft);
+      
+      // Sofort alle Formularfelder aktualisieren, damit der Benutzer keine Seite aktualisieren muss
+      try {
+        // Setze Adresse
+        if (orderDraft.addressId) {
+          console.log("Setze Adresse:", orderDraft.addressId);
+          form.setValue('addressId', orderDraft.addressId, { shouldValidate: true });
+        }
+        
+        // Setze Lieferdatum - Datum korrekt konvertieren
+        if (orderDraft.desiredDeliveryDate) {
+          // Stelle sicher, dass das Datum korrekt formatiert ist
+          const deliveryDate = new Date(orderDraft.desiredDeliveryDate);
+          console.log("Setze Lieferdatum:", deliveryDate);
+          if (!isNaN(deliveryDate.getTime())) {
+            form.setValue('desiredDeliveryDate', deliveryDate, { shouldValidate: true });
+          } else {
+            console.error("Ungültiges Datumsformat:", orderDraft.desiredDeliveryDate);
+          }
+        }
+        
+        // Setze Zeitfenster
+        if (orderDraft.desiredTimeSlot && 
+            ['morning', 'afternoon', 'evening'].includes(orderDraft.desiredTimeSlot)) {
+          console.log("Setze Zeitfenster:", orderDraft.desiredTimeSlot);
+          form.setValue('desiredTimeSlot', orderDraft.desiredTimeSlot as TimeSlot, { shouldValidate: true });
+        }
+        
+        // Setze zusätzliche Anweisungen
+        if (orderDraft.additionalInstructions) {
+          console.log("Setze Anweisungen:", orderDraft.additionalInstructions);
+          form.setValue('additionalInstructions', orderDraft.additionalInstructions, { shouldValidate: true });
+        }
+        
+        // Setze Filialwert für Produktformular
+        if (orderDraft.store) {
+          console.log("Setze Filiale:", orderDraft.store);
+          setStoreValue(orderDraft.store);
+          // Kein form.setValue mehr nötig, da es nur noch storeValue verwendet wird
+          setHasSetStoreFromCart(true);
+        }
+
+        // Wenn orderItems im Entwurf vorhanden sind, setze sie auch
+        if (orderDraft.orderItems && 
+            Array.isArray(orderDraft.orderItems) && 
+            orderDraft.orderItems.length > 0) {
+          
+          console.log("Setze gespeicherte Produkte:", orderDraft.orderItems);
+          
+          // Konvertiere die orderItems in das richtige Format, falls nötig
+          const formattedItems = orderDraft.orderItems.map(item => ({
+            productName: item.productName || '',
+            quantity: String(item.quantity || ''),
+            notes: item.notes || '',
+            store: item.store || orderDraft.store || '',
+            // Stellen Sie sicher, dass Bildpfade übernommen werden
+            imageUrl: item.imageUrl || item.filePath || '',
+            filePath: item.filePath || item.imageUrl || ''
+          }));
+          
+          setOrderItems(formattedItems);
+          form.setValue('orderItems', formattedItems, { shouldValidate: true });
+          
+          // Auch zum Warenkorb hinzufügen, damit Konsistenz gewährleistet ist
+          if (saveCart && orderDraft.store) {
+            saveCart(formattedItems, orderDraft.store);
+          }
+        }
+      } catch (error) {
+        console.error("Fehler beim Setzen der Formularwerte:", error);
+      }
+    } else {
+      console.log("Kein Formularentwurf vorhanden oder leerer Entwurf");
+    }
+    
+  }, [orderDraft, isLoadingDraft, form, saveCart]);
+
+  // Effekt, um die Filiale aus dem Warenkorb zu ermitteln
+  useEffect(() => {
+    if (hasSetStoreFromCart || storeValue || cart.items.length === 0) {
+      return;
+    }
+
+    const allStores = cart.items.map(item => item.store).filter(Boolean);
+    
+    if (allStores.length > 0) {
+      const allSameStore = allStores.every(store => store === allStores[0]);
+      
+      if (allSameStore) {
+        setStoreValue(allStores[0]);
+        setHasSetStoreFromCart(true);
+        // Kein form.setValue mehr, da store nicht mehr im Formular ist
+      }
+    } else if (cart.store) {
+      setStoreValue(cart.store);
+      setHasSetStoreFromCart(true);
+    }
+  }, [cart, hasSetStoreFromCart, storeValue]);
+
+  // Load cart items - verbesserte Version
+  useEffect(() => {
+    // Verarbeite alle Zustandsänderungen des Warenkorbs sofort
+    if (!cartLoading) {
+      console.log("Warenkorb geladen:", cart);
+      
+      // Sicherstellen, dass cart.items ein gültiges Array ist
+      if (cart && cart.items && Array.isArray(cart.items) && cart.items.length > 0) {
+        const mappedItems: InsertOrderItem[] = cart.items.map(item => ({
+          productName: item.productName,
+          quantity: String(item.quantity),
+          notes: item.notes || '',
+          store: item.store || cart.store || '',
+          // Stellen Sie sicher, dass Bildpfade übernommen werden
+          imageUrl: item.imageUrl || item.filePath || '',
+          filePath: item.filePath || item.imageUrl || ''
+        }));
+        
+        console.log("Warenkorb-Elemente für Bestellseite geladen:", mappedItems);
+        setOrderItems(mappedItems);
+        form.setValue('orderItems', mappedItems);
+      } else {
+        console.log("Warenkorb ist leer, setze Elemente zurück");
+        setOrderItems([]);
+        form.setValue('orderItems', []);
+      }
+    }
+    
+    // Nach dem Laden der Daten den Ladezustand beenden
+    if (!cartLoading) {
+      setLoadingInitialState(false);
+    }
+  }, [cart, cartLoading, form]);
+
+  // Create order mutation
+  const createOrderMutation = useMutation({
+    mutationFn: async (data: OrderFormValues) => {
+      setIsSubmitting(true);
+      
+      try {
+        // Prüfe, ob Produkte im Warenkorb vorhanden sind
+        if (cart.items.length === 0 || !orderItems.length) {
+          throw new Error("Bitte fügen Sie mindestens ein Produkt zum Warenkorb hinzu");
+        }
+        
+        // Prüfe, ob alle Produkte eine Filiale haben (jedes Produkt muss eine eigene Filiale haben)
+        const itemsWithoutStore = orderItems.filter(item => !item.store || item.store.trim() === '');
+        
+        if (itemsWithoutStore.length > 0) {
+          throw new Error(`Bitte wählen Sie für alle Produkte eine Filiale aus. Produkt "${itemsWithoutStore[0].productName}" hat keine Filiale.`);
+        }
+
+        // Gemeinsame Filiale aus den Produkten ableiten
+        const allStores = orderItems.map(item => item.store).filter(Boolean);
+        const commonStore = allStores.length > 0 ? 
+          (allStores.every(store => store === allStores[0]) ? allStores[0] : storeValue || '') : 
+          storeValue || '';
+        
+        const orderData = {
+          addressId: data.addressId,
+          desiredDeliveryDate: data.desiredDeliveryDate,
+          desiredTimeSlot: data.desiredTimeSlot,
+          additionalInstructions: data.additionalInstructions,
+          store: commonStore, // Gemeinsame Filiale aus den Produkten oder storeValue
+          orderItems: orderItems.map(item => ({
+            productName: item.productName,
+            quantity: item.quantity,
+            notes: item.notes || '',
+            // Jedes Produkt muss bereits seine eigene Filiale haben (keine Fallback-Logik mehr)
+            store: item.store,
+            // Bildpfade beibehalten - Wir verwenden TypeScript-Casting für Kompatibilität
+            imageUrl: (item as any).imageUrl || (item as any).filePath || '',
+            // Speichern der Bild-URL auch im filePath-Feld für bessere Kompatibilität
+            filePath: (item as any).filePath || (item as any).imageUrl || ''
+          }))
+        };
+
+        const response = await apiRequest('/api/orders', {
+          method: 'POST',
+          body: JSON.stringify(orderData)
+        });
+
+        const responseData = await response.json();
+        return responseData;
+      } finally {
+        setIsSubmitting(false);
+      }
+    },
+    onSuccess: (data) => {
+      toast({
+        title: 'Bestellung aufgegeben',
+        description: `Ihre Bestellung mit der Nummer ${data.orderNumber} wurde erfolgreich aufgegeben.`,
+        variant: 'success'
+      });
+      
+      // Warenkorb im stillen Modus leeren, um zusätzliche Toast-Benachrichtigung zu vermeiden
+      clearCart(true);
+      setHasSetStoreFromCart(false);
+      
+      if (isAuthenticated) {
+        deleteOrderDraftMutation.mutate();
+      }
+      
+      // Timeout hinzufügen, um sicherzustellen, dass alle Prozesse abgeschlossen sind
+      setTimeout(() => {
+        // Korrekte Route aus App.tsx verwenden (/orders statt /my-orders)
+        navigate('/orders');
+      }, 100);
+    },
+    onError: (error: Error) => {
+      toast({
+        title: 'Fehler',
+        description: error.message || 'Ein unbekannter Fehler ist aufgetreten.',
+        variant: 'destructive',
+      });
+    }
+  });
+
+  // Clear cart handler
+  const handleClearCart = () => {
+    // Warenkorb leeren mit Toast-Benachrichtigung (silent = false), da dies
+    // eine explizite Benutzeraktion ist
+    clearCart(false);
+    setOrderItems([]);
+    // Kein form.setValue('store', '') mehr nötig
+    setStoreValue('');
+    setHasSetStoreFromCart(false);
+    
+    if (isAuthenticated) {
+      deleteOrderDraftMutation.mutate();
+    }
+  };
+  
+  // Submit handler
+  const onSubmit = (values: OrderFormValues) => {
+    createOrderMutation.mutate(values);
+  };
+
+  // If no addresses, show message to add an address
+  if (addresses.length === 0 && !isLoadingAddresses) {
+    return (
+      <MainLayout>
+        <div className="py-8">
+          <div className="container mx-auto px-4">
+            <h1 className="text-3xl font-bold mb-8 font-sans">Neue Bestellung</h1>
+            <Card>
+              <CardHeader>
+                <CardTitle>Keine Lieferadresse vorhanden</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <p className="mb-4">Bitte fügen Sie erst eine Lieferadresse hinzu, bevor Sie eine Bestellung aufgeben.</p>
+                <Button asChild>
+                  <Link href="/profile">Zum Profil</Link>
+                </Button>
+              </CardContent>
+            </Card>
+          </div>
+        </div>
+      </MainLayout>
+    );
+  }
+
+  return (
+    <MainLayout>
+      <section className="py-8">
+        <div className="container mx-auto px-4">
+          {/* Immer anzeigen, unabhängig vom Warenkorb-Status */}
+          <div className="flex justify-between items-center mb-8">
+            <h1 className="text-3xl font-bold">Neue Bestellung</h1>
+            {!cartIsEmpty && (
+              <Button
+                variant="destructive"
+                onClick={handleClearCart}
+                disabled={cartLoading}
+                size="sm"
+                className="flex items-center gap-2"
+              >
+                <Trash2 className="h-4 w-4" />
+                {cartLoading ? "Wird geleert..." : "Warenkorb leeren"}
+              </Button>
+            )}
+          </div>
+          
+          {/* Warenkorb-Leer-Hinweis entfernt */}
+
+          {/* Bestellformular mit mehreren Cards */}
+          <Form {...form}>
+            <form onSubmit={handleSubmit(onSubmit)} className="space-y-6">
+              
+              {/* CARD 1: Lieferadresse */}
+              <Card className="mb-6 border-primary/20 shadow-sm">
+                <CardHeader className="bg-blue-50 pb-3">
+                  <CardTitle className="flex items-center gap-2 text-xl">
+                    <div className="bg-blue-600 text-white rounded-full w-6 h-6 flex items-center justify-center mr-1 text-sm font-bold">1</div>
+                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-blue-600"><path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"/><circle cx="12" cy="10" r="3"/></svg>
+                    Lieferadresse
+                  </CardTitle>
+                  <CardDescription>Wohin soll Ihre Bestellung geliefert werden?</CardDescription>
+                </CardHeader>
+                <CardContent className="pt-4">
+                  <FormField
+                    control={control}
+                    name="addressId"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Lieferadresse <span className="text-red-500">*</span></FormLabel>
+                        <FormControl>
+                          <select
+                            {...field}
+                            onChange={(e) => {
+                              field.onChange(parseInt(e.target.value));
+                              saveFormState({
+                                ...getValues(),
+                                addressId: parseInt(e.target.value)
+                              });
+                            }}
+                            className="w-full p-2 border border-gray-300 rounded-md focus:outline-none focus:border-primary"
+                          >
+                            <option value="">Adresse auswählen</option>
+                            {addresses.map((address) => (
+                              <option key={address.id} value={address.id}>
+                                {address.name ? `${address.name}: ` : ""}{address.fullName ? `${address.fullName}, ` : ""}
+                                {address.street} {address.houseNumber}, {address.postalCode} {address.city}
+                                {address.additionalInfo ? ` (${address.additionalInfo})` : ""}
+                              </option>
+                            ))}
+                          </select>
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+
+                  <Link href="/profile" className="text-primary text-sm hover:underline block mt-3">
+                    Neue Adresse hinzufügen
+                  </Link>
+                </CardContent>
+              </Card>
+
+              {/* CARD 2: Liefertermin */}
+              <Card className="mb-6 border-primary/20 shadow-sm">
+                <CardHeader className="bg-purple-50 pb-3">
+                  <CardTitle className="flex items-center gap-2 text-xl">
+                    <div className="bg-purple-600 text-white rounded-full w-6 h-6 flex items-center justify-center mr-1 text-sm font-bold">2</div>
+                    <CalendarIcon className="h-5 w-5 text-purple-600" />
+                    Liefertermin
+                  </CardTitle>
+                  <CardDescription>Wann soll Ihre Bestellung ankommen?</CardDescription>
+                </CardHeader>
+                <CardContent className="pt-4">
+                  <div className="space-y-4">
+                    <FormField
+                      control={control}
+                      name="desiredDeliveryDate"
+                      render={({ field }) => (
+                        <FormItem className="flex flex-col">
+                          <FormLabel>Gewünschtes Lieferdatum <span className="text-red-500">*</span></FormLabel>
+                          <Popover open={calendarOpen} onOpenChange={setCalendarOpen}>
+                            <PopoverTrigger asChild>
+                              <FormControl>
+                                <Button
+                                  variant={"outline"}
+                                  className={cn(
+                                    "w-full pl-3 text-left font-normal",
+                                    !field.value && "text-muted-foreground"
+                                  )}
+                                >
+                                  {field.value ? (
+                                    format(new Date(field.value), "PPP", { locale: de })
+                                  ) : (
+                                    <span>Datum auswählen</span>
+                                  )}
+                                  <CalendarIcon className="ml-auto h-4 w-4 opacity-50" />
+                                </Button>
+                              </FormControl>
+                            </PopoverTrigger>
+                            <PopoverContent className="w-auto p-0" align="start">
+                              <Calendar
+                                mode="single"
+                                selected={field.value ? new Date(field.value) : undefined}
+                                onSelect={(date) => {
+                                  if (date) {
+                                    field.onChange(date);
+                                    saveFormState({
+                                      ...getValues(),
+                                      desiredDeliveryDate: date
+                                    });
+                                    
+                                    // Schließen des Kalenders nach der Auswahl
+                                    setCalendarOpen(false);
+                                  }
+                                }}
+                                fromDate={new Date()}
+                                initialFocus
+                              />
+                            </PopoverContent>
+                          </Popover>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+
+                    <FormField
+                      control={control}
+                      name="desiredTimeSlot"
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>Gewünschter Zeitraum <span className="text-red-500">*</span></FormLabel>
+                          <FormControl>
+                            <select
+                              {...field}
+                              className="w-full p-2 border border-gray-300 rounded-md focus:outline-none focus:border-primary"
+                              onChange={(e) => {
+                                field.onChange(e.target.value);
+                                saveFormState({
+                                  ...getValues(),
+                                  desiredTimeSlot: e.target.value as TimeSlot
+                                });
+                              }}
+                            >
+                              <option value="">Zeitraum auswählen</option>
+                              <option value="morning">Vormittags (8-12 Uhr)</option>
+                              <option value="afternoon">Nachmittags (12-16 Uhr)</option>
+                              <option value="evening">Abends (16-20 Uhr)</option>
+                            </select>
+                          </FormControl>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                  </div>
+                </CardContent>
+              </Card>
+
+              {/* CARD 3: Produkte */}
+              <Card className="mb-6 border-primary/20 shadow-sm bg-green-50">
+                <CardHeader className="bg-green-100 pb-3">
+                  <CardTitle className="flex items-center gap-2 text-xl">
+                    <div className="bg-green-600 text-white rounded-full w-6 h-6 flex items-center justify-center mr-1 text-sm font-bold">3</div>
+                    <ShoppingCart className="h-5 w-5 text-green-600" />
+                    Produkte hinzufügen
+                  </CardTitle>
+                  <CardDescription>Fügen Sie hier die Produkte hinzu, die Sie bestellen möchten</CardDescription>
+                </CardHeader>
+                <CardContent className="pt-4">
+                  <FormField
+                    control={control}
+                    name="orderItems"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel className="text-lg font-medium">Neue Produkte eingeben <span className="text-red-500">*</span></FormLabel>
+                        <FormControl>
+                          <div>
+                            <ProductEntryForm
+                              control={control}
+                              name="orderItems"
+                              value={orderItems}
+                              onChange={(items) => {
+                                // Update lokalen Warenkorb und Formularfeld
+                                setOrderItems(items);
+                                field.onChange(items);
+                                
+                                // Speichere Formularstatus für angemeldete Benutzer
+                                saveFormState({
+                                  ...getValues(),
+                                  orderItems: items
+                                });
+                                
+                                // Mit dem Server synchronisieren
+                                saveCart(items.map(item => ({
+                                  productName: item.productName,
+                                  quantity: item.quantity,
+                                  notes: item.notes || '',
+                                  store: item.store || storeValue || '',
+                                  // Bildpfade für die Konsistenz zwischen Komponenten hinzufügen
+                                  imageUrl: (item as any).imageUrl || '',
+                                  filePath: (item as any).filePath || (item as any).imageUrl || ''
+                                })), storeValue);
+                              }}
+                              storeValue={storeValue}
+                            />
+                          </div>
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                </CardContent>
+              </Card>
+
+              {/* CARD 4: Zusätzliche Anweisungen */}
+              <Card className="mb-6 border-primary/20 shadow-sm">
+                <CardHeader className="bg-amber-50 pb-3">
+                  <CardTitle className="flex items-center gap-2 text-xl">
+                    <div className="bg-amber-600 text-white rounded-full w-6 h-6 flex items-center justify-center mr-1 text-sm font-bold">4</div>
+                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-amber-600"><path d="M10 9.5a2.5 2.5 0 1 1 5 0 2.5 2.5 0 0 1-5 0Z"/><path d="M10 17a.5.5 0 1 1 0-1 .5.5 0 0 1 0 1Z"/><path d="M14 17a.5.5 0 1 1 0-1 .5.5 0 0 1 0 1Z"/><path d="M18 17a.5.5 0 1 1 0-1 .5.5 0 0 1 0 1Z"/><path d="M20.8 16c-1.1-1.2-2.4-2-3.8-2h-8c-1.4 0-2.7.8-3.8 2-1.2 1.2-2.2 3-2.2 5v1h20v-1c0-2-.9-3.8-2.2-5Z"/><path d="M15.5 9.5c0-.3.7-7.5-2.5-7.5s-2.2 7.2-2.5 7.5"/></svg>
+                    Hinweise
+                  </CardTitle>
+                  <CardDescription>Haben Sie zusätzliche Anweisungen für die Lieferung?</CardDescription>
+                </CardHeader>
+                <CardContent className="pt-4">
+                  <FormField
+                    control={control}
+                    name="additionalInstructions"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Zusätzliche Anweisungen</FormLabel>
+                        <FormControl>
+                          <Textarea 
+                            placeholder="z.B. Bitte klingeln Sie zweimal" 
+                            {...field}
+                            onChange={(e) => {
+                              // Nur lokale Aktualisierung ohne Server-Anfrage
+                              field.onChange(e.target.value);
+                            }}
+                            // Beim Verlassen des Felds ebenfalls aktualisieren
+                            onBlur={(e) => {
+                              field.onBlur();
+                              saveFormState({
+                                ...getValues(),
+                                additionalInstructions: e.target.value
+                              });
+                            }}
+                          />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                </CardContent>
+              </Card>
+
+              {/* CARD 5: Bestellung abschließen */}
+              <Card className="mb-6 border-red-300 shadow-sm bg-red-50">
+                <CardHeader className="bg-red-100 pb-3">
+                  <CardTitle className="flex items-center gap-2 text-xl">
+                    <div className="bg-red-600 text-white rounded-full w-6 h-6 flex items-center justify-center mr-1 text-sm font-bold">5</div>
+                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" className="text-red-600 mr-1"><path d="M6 2 3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4Z"/><path d="M3 6h18"/><path d="M16 10a4 4 0 0 1-8 0"/></svg>
+                    Bestellung abschließen
+                  </CardTitle>
+                  <CardDescription>Wenn Sie fertig sind, geben Sie Ihre Bestellung auf</CardDescription>
+                </CardHeader>
+                <CardContent className="pt-4">
+                  <div className="flex flex-col sm:flex-row space-y-4 sm:space-y-0 sm:space-x-4">
+                    <Button 
+                      type="submit" 
+                      disabled={isSubmitting || isLoadingAddresses || loadingInitialState}
+                      className="flex-1 bg-red-600 hover:bg-red-700 text-white font-bold py-3"
+                    >
+                      {isSubmitting ? (
+                        <>
+                          <Loader2 className="mr-2 h-5 w-5 animate-spin" />
+                          Bestellung wird aufgegeben...
+                        </>
+                      ) : (
+                        <>
+                          <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" className="mr-2"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
+                          Bestellung jetzt aufgeben
+                        </>
+                      )}
+                    </Button>
+                    <Button 
+                      type="button" 
+                      variant="outline" 
+                      onClick={handleClearCart}
+                      disabled={isSubmitting || orderItems.length === 0}
+                      className="flex-1 border-red-300 text-red-600 hover:bg-red-50"
+                    >
+                      <Trash2 className="mr-2 h-4 w-4" />
+                      Warenkorb leeren
+                    </Button>
+                  </div>
+                </CardContent>
+              </Card>
+            </form>
+          </Form>
+        </div>
+      </section>
+    </MainLayout>
+  );
+}
