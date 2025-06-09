@@ -4,6 +4,8 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { errorHandler } from '../middleware/error/error.middleware';
 import { NotFoundError } from '../utils/errors';
+import adminRoutes from './admin.routes';
+
 
 // Standardrouten importieren
 import { registerHealthRoutes } from './health.routes';
@@ -23,6 +25,9 @@ export const notFoundHandler = (req: Request, res: Response, next: NextFunction)
 export function registerApiRoutes(router: Router): void {
   // Health-Check-Routen
   registerHealthRoutes(router);
+  
+  // Admin-Routen
+  router.use('/api/v2/admin', adminRoutes);
   
   // Weitere Routengruppen hier registrieren
   // z.B. registerAuthRoutes(router);

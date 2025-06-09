@@ -12,7 +12,7 @@
  */
 // Für die Entwicklung auf Replit wird die DATABASE_URL-Umgebungsvariable verwendet
 // Für die Produktion wird dieser feste Connection-String verwendet, wenn keine Umgebungsvariable verfügbar ist
-export const DB_CONNECTION_STRING = 'postgresql://achis_user:deinSicheresPasswort@localhost:5432/achis_einkaufsservice';
+export const DB_CONNECTION_STRING = 'postgresql://achis_user:Jaguar2222@localhost:5432/einkaufsservice';
 
 /**
  * Schnittstelle für Datenbank-Konfigurationsoptionen
